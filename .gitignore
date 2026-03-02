@@ -1,0 +1,9 @@
+build/
+install/
+log/
+data/
+models/
+runs/
+plots/
+scalers/
+__pycache__/
