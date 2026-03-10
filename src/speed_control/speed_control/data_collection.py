@@ -16,7 +16,14 @@ REAL_HARD_LIMIT = 1.57     # 事後統計用的真實極限 (90度)
 ALGORITHM_SAFE_LIMIT = 1.2 # 生成器使用的「假牆壁」，預留了很大的物理滑行空間 (約70度)
 VEL_TO_POS_GAIN = 0.7    
 MAX_SLEW_RATE = 4.0 
-ABORT_LIMIT = 1.5 # 超過這個角度就直接進入 RESET 階段 (約86度)     
+ABORT_LIMIT = 1.5 # 超過這個角度就直接進入 RESET 階段 (約86度)
+
+TEST_SPEED = 10.0
+RESET_DURATION = 5
+RESET_KP = 2.0
+RESET_MAX_SPEED = 2.0
+JOINT_LIMIT = 3.0
+MOTOR_LIMIT = 3.0
 
 def simulate_integral(u, dt):
     return np.cumsum(u) * dt * VEL_TO_POS_GAIN
@@ -168,6 +175,114 @@ def build_signal_from_info(config, info):
         raw = np.zeros(length)
         
     return apply_slew_rate_limiter(raw, MAX_SLEW_RATE)
+
+class IsaacMotorTest(Node):
+    def __init__(self):
+        super().__init__('isaac_motor_test')
+
+        self.target_names = ["Motor", "Joint"]
+        self.subscription = self.create_subscription(JointState, '/joint_states', self.listener_callback, 10)
+        self.get_logger().info("已啟動：關節狀態監聽中...")
+
+        self.topic_name = '/motor_control'
+        self.publisher_ = self.create_publisher(Float64, self.topic_name, 10)
+
+        self.dt = 0.05
+        self.timer = self.create_timer(self.dt, self.timer_callback)
+
+        self.state = "RUN_POS"
+        self.test_duration = 0.05 
+        self.phase_timer = 0.0     
+
+        self.current_joint_pos = 0.0
+        self.current_motor_pos = 0.0
+        
+        self.empiric_gain = 0.7 
+
+        self.get_logger().info(f"已啟動：速度發送中 -> {self.topic_name}")
+
+    def listener_callback(self, msg):
+        output_str = ""
+        found_any = False 
+
+        for target in self.target_names:
+            if target in msg.name:
+                idx = msg.name.index(target)
+                pos = msg.position[idx]
+                vel = msg.velocity[idx]
+
+                if target == "Joint":
+                    self.current_joint_pos = pos
+                elif target == "Motor":
+                    self.current_motor_pos = pos
+                
+                output_str += f"[{target}] 角:{pos:.2f} 速:{vel:.2f} | "
+                found_any = True
+
+        if found_any:
+            print(f"📥 [狀態] {output_str}", end='\r')
+
+    def timer_callback(self):     
+        msg = Float64()
+        fail_joint = abs(self.current_joint_pos) > JOINT_LIMIT
+        fail_motor = abs(self.current_motor_pos) > MOTOR_LIMIT
+        
+        if fail_joint or fail_motor:
+            print(f"\n\n🚨 測試結束！已獲得充分數據。")
+            
+            # --- 乾淨俐落的印出 ---
+            print("\n" + "="*50)
+            print(" 📊 動態增益測試結果")
+            print("="*50)
+            print(f"🔹 建議 VEL_TO_POS_GAIN = {self.empiric_gain:.3f}")
+            print("="*50 + "\n")
+            
+            msg.data = 0.0
+            self.publisher_.publish(msg)
+            self.state = "STOP"
+            raise SystemExit
+            
+        if self.state == "RUN_POS":
+            if self.phase_timer < self.test_duration:
+                msg.data = TEST_SPEED 
+                self.phase_timer += self.dt
+            else:
+                # 結算 Gain = 當前馬達位置 / (速度 * 時間)
+                if self.test_duration > 0:
+                    self.empiric_gain = abs(self.current_motor_pos) / (TEST_SPEED * self.test_duration)
+                self.state = "RUN_NEG"
+                self.phase_timer = 0.0
+
+        elif self.state == "RUN_NEG":
+            if self.phase_timer < self.test_duration:
+                msg.data = -TEST_SPEED 
+                self.phase_timer += self.dt
+            else:
+                self.state = "RESET"
+                self.phase_timer = 0.0
+                msg.data = 0.0
+                print(f"\n✅ 通過 {self.test_duration:.2f}s (Joint:{abs(self.current_joint_pos):.2f}) -> 歸零中...")
+
+        elif self.state == "RESET":
+            error = 0.0 - self.current_motor_pos
+            control_effort = error * RESET_KP
+
+            if control_effort > RESET_MAX_SPEED: control_effort = RESET_MAX_SPEED
+            elif control_effort < -RESET_MAX_SPEED: control_effort = -RESET_MAX_SPEED
+            
+            msg.data = control_effort
+
+            if self.phase_timer < RESET_DURATION:
+                self.phase_timer += self.dt
+            else:
+                self.state = "RUN_POS"
+                self.phase_timer = 0.0
+                self.test_duration += 0.05 
+                
+        elif self.state == "STOP":
+            msg.data = 0.0
+
+        self.publisher_.publish(msg)
 
 class IsaacDataCollector(Node):
     def __init__(self, mode='train'):
@@ -361,21 +476,53 @@ class IsaacDataCollector(Node):
         print("==========================================\n")
 
 def main(args=None):
-    print("請選擇執行模式:\n1: 蒐集訓練資料 (Train Mode)\n2: 蒐集測試資料 (Test Mode)")
-    mode = 'test' if input("輸入選項 (1/2): ").strip() == '2' else 'train'
+    global VEL_TO_POS_GAIN
+    
+    print("==================================")
+    print("請選擇執行模式:")
+    print("1: 蒐集訓練資料 (Train Mode)")
+    print("2: 蒐集測試資料 (Test Mode)")
+    print("3: 測試動態增益 (Gain Test Mode)")
+    print("==================================")
+    choice = input("輸入選項 (1/2/3): ").strip()
     
     rclpy.init(args=args)
-    node = IsaacDataCollector(mode=mode)
-    
-    try: 
-        rclpy.spin(node)
-    except SystemExit: 
-        pass
-    except KeyboardInterrupt: 
-        pass
-    finally: 
-        node.destroy_node()
-        rclpy.shutdown()
+
+    if choice == '3':
+        node = IsaacMotorTest()
+        try:
+            rclpy.spin(node)
+        except SystemExit:
+            pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+    else:
+        mode = 'test' if choice == '2' else 'train'
+        print("\n--- 請輸入環境動態增益 (直接按 Enter 可保留預設值) ---")
+        try:
+            in_gain = input(f"➤ VEL_TO_POS_GAIN (預設 {VEL_TO_POS_GAIN}): ").strip()
+            if in_gain: VEL_TO_POS_GAIN = float(in_gain)
+        except ValueError:
+            print("⚠️ 輸入格式錯誤，將使用預設值。")
+            
+        print("\n✅ 即將使用的參數設定:")
+        print(f" - VEL_TO_POS_GAIN      = {VEL_TO_POS_GAIN}")
+        print("-" * 40)
+        
+        node = IsaacDataCollector(mode=mode)
+        
+        try: 
+            rclpy.spin(node)
+        except SystemExit: 
+            pass
+        except KeyboardInterrupt: 
+            pass
+        finally: 
+            node.destroy_node()
+            rclpy.shutdown()
 
 if __name__ == '__main__': 
     main()
