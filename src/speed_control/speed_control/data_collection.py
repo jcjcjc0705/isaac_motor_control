@@ -229,6 +229,13 @@ class IsaacMotorTest(Node):
         
         if fail_joint or fail_motor:
             print(f"\n\n🚨 測試結束！已獲得充分數據。")
+
+            limit_hit = MOTOR_LIMIT if fail_motor else JOINT_LIMIT
+            safe_duration = self.test_duration - self.dt 
+            if safe_duration <= 0: 
+                safe_duration = self.dt
+            ideal_distance = TEST_SPEED * safe_duration
+            self.empiric_gain = limit_hit / ideal_distance
             
             # --- 乾淨俐落的印出 ---
             print("\n" + "="*50)
