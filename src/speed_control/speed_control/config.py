@@ -7,7 +7,7 @@ import time
 TARGET_DATA_FILE = "data/train.csv"
 
 STATE_DIM = 128   # 模型階數
-OUTPUT_DIM = 2    # 輸出維度 (vel_m, vel_j)
+OUTPUT_DIM = 3    # 輸出維度 (vel_m, vel_j)
 
 # --- 其他設定 ---
 EPISODE_LEN = 200          # 每個回合蒐集 200 步 -> 配合 Training Seq Len

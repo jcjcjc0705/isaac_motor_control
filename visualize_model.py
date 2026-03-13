@@ -58,26 +58,31 @@ class NSSM(torch.nn.Module):
         return torch.cat(y_pred_list, dim=1)
 
 class CascadedSystem(torch.nn.Module):
-    def __init__(self, state_dim, raw_input_dim, history_window):
+    def __init__(self, state_dim, raw_input_dim, history_window, output_dim):
         super().__init__()
+        self.output_dim = output_dim
 
+        # Input: [u, diff] -> multiplier = 2
         self.feature_multiplier = 2    
-        self.motor_input_dim = (raw_input_dim * self.feature_multiplier) * history_window
+        base_input_dim = (raw_input_dim * self.feature_multiplier) * history_window
 
-        self.motor_output_dim = 1 
-        self.motor_net = NSSM(state_dim, self.motor_input_dim, output_dim=self.motor_output_dim)
+        self.stages = torch.nn.ModuleList()
+        curr_input_dim = base_input_dim
 
-        self.joint_input_dim = self.motor_input_dim + self.motor_output_dim 
-        self.joint_net = NSSM(state_dim, self.joint_input_dim, output_dim=1)
+        for i in range(output_dim):
+            self.stages.append(NSSM(state_dim, curr_input_dim, output_dim=1))
+            curr_input_dim += 1
 
-    def forward(self, u_sequence, x_init_motor, x_init_joint):
-        pred_motor = self.motor_net(u_sequence, x_init_motor)
-        motor_feature = pred_motor.detach()
-        
-        joint_input = torch.cat([u_sequence, motor_feature], dim=2)
-        pred_joint = self.joint_net(joint_input, x_init_joint)
-        
-        return torch.cat([pred_motor, pred_joint], dim=2)
+    def forward(self, u_sequence, x_inits):
+        current_input = u_sequence
+        outputs = []
+
+        for i in range(self.output_dim):
+            pred = self.stages[i](current_input, x_inits[i])
+            outputs.append(pred)
+            current_input = torch.cat([current_input, pred.detach()], dim=2)
+
+        return torch.cat(outputs, dim=2)
 
 def calculate_metrics(y_true, y_pred):
     """計算 R2 Score 和 MSE"""
@@ -111,13 +116,13 @@ def visualize():
     y_mean = torch.tensor(scaler["y_mean"])
     y_std = torch.tensor(scaler["y_std"])
 
-    # 2. 載入模型
+    # 2. 載入模型 (動態支援 OUTPUT_DIM)
     if not os.path.exists(cfg.model_save_path):
         print(f"Error: Model file not found at {cfg.model_save_path}")
         return
 
     REAL_INPUT_DIM = cfg.input_dim * cfg.history_window
-    model = CascadedSystem(cfg.state_dim, cfg.input_dim, cfg.history_window)
+    model = CascadedSystem(cfg.state_dim, cfg.input_dim, cfg.history_window, cfg.output_dim)
     
     try:
         model.load_state_dict(torch.load(cfg.model_save_path, map_location=device))
@@ -129,8 +134,9 @@ def visualize():
     model.eval()
 
     df = pd.read_csv(cfg.data_file)
+    df_cols = df.columns.tolist()
     
-    # 挑選不同類型的 Episode ID (涵蓋 RAMPS, PRBS, CHIRP)
+    # 挑選不同類型的 Episode ID
     test_ids = [10, 100, 250, 400, "test"]
 
     if os.path.exists(cfg.data_file):
@@ -139,18 +145,19 @@ def visualize():
         print(f"Warning: Train data file not found at {cfg.data_file}")
         df_train = None
 
-    # 定義測試資料路徑
     test_data_path = os.path.join(cfg.save_dir, "test.csv")
     
     input_cols = ["input_u"]
     
-    # 動態決定輸出欄位名稱
+    # 動態決定輸出欄位名稱 (支援新舊版與維度)
+    j1_name = "vel_joint1" if "vel_joint1" in df_cols else "vel_joint"
     if cfg.output_dim == 2:
-        target_cols = ["vel_motor", "vel_joint"]
+        target_cols = ["vel_motor", j1_name]
+    elif cfg.output_dim == 3:
+        target_cols = ["vel_motor", j1_name, "vel_joint2"]
     else:
-        target_cols = ["pos_motor", "vel_motor", "pos_joint", "vel_joint"]
+        raise ValueError(f"Unsupported OUTPUT_DIM: {cfg.output_dim}")
 
-    # 建立輸出資料夾
     output_dir = "plots"
     os.makedirs(output_dir, exist_ok=True)
     print(f"Generating plots in '{output_dir}/'...")
@@ -158,20 +165,14 @@ def visualize():
     for ep_id in test_ids:
         group = None
         
-        # --- [分支] 判斷要讀哪個檔案 ---
         if ep_id == "test":
-            # 如果是測試模式，讀取 test.csv
             if os.path.exists(test_data_path):
                 print(f"Loading Test Data from {test_data_path}...")
                 df_test = pd.read_csv(test_data_path)
 
                 total_len = len(df_test)
-                
-                # ✅ 應用自訂的切片參數
                 start_idx = TEST_START_STEP
                 end_idx = start_idx + TEST_SEQ_LEN if TEST_SEQ_LEN is not None else total_len
-                
-                # 確保 end_idx 不會超出資料長度
                 end_idx = min(end_idx, total_len)
 
                 if start_idx < total_len:
@@ -184,7 +185,6 @@ def visualize():
                 print(f"Test data file not found: {test_data_path}, skipping.")
                 continue
         else:
-            # 如果是訓練模式，從 df_train 篩選
             if df_train is not None:
                 group = df_train[df_train["episode_id"] == ep_id]
             
@@ -212,9 +212,9 @@ def visualize():
         u_norm = (u_tensor - u_mean) / u_std
 
         with torch.no_grad():
-            x_init_motor = torch.zeros(1, cfg.state_dim)
-            x_init_joint = torch.zeros(1, cfg.state_dim)
-            y_pred_norm = model(u_norm, x_init_motor, x_init_joint)
+            # 動態生成 x_inits 列表
+            x_inits = [torch.zeros(1, cfg.state_dim).to(device) for _ in range(cfg.output_dim)]
+            y_pred_norm = model(u_norm, x_inits)
             
         # 反正規化
         y_pred = y_pred_norm * y_std + y_mean
@@ -222,22 +222,26 @@ def visualize():
         
         time_steps = np.arange(len(group)) * cfg.dt
         
-        plt.figure(figsize=(12, 9))
+        # 動態決定子圖數量 (Input + 所有 Output)
+        total_plots = 1 + cfg.output_dim
+        # 根據子圖數量調整圖片高度，避免擠在一起
+        fig_height = 3 * total_plots 
+        plt.figure(figsize=(12, fig_height))
         plt.suptitle(f"Prediction - {ep_id}", fontsize=16)
         
-        # 1. Input
-        plt.subplot(3, 1, 1)
+        # 1. 畫 Input 訊號
+        plt.subplot(total_plots, 1, 1)
         plt.plot(time_steps, u_raw_numpy[:, 0], 'k--', label="Input")
-        plt.title("Input Signal")
-        plt.legend()
+        plt.title("Input Signal (Velocity Command)")
+        plt.legend(loc="upper right")
         plt.grid(True, alpha=0.3)
 
-        # 2. Output
+        # 2. 畫所有 Output 訊號
         for i, col_name in enumerate(target_cols):
-            plt.subplot(3, 1, i + 2)
+            plt.subplot(total_plots, 1, i + 2)
             
             y_true_seq = y_raw_numpy[:, i]
-            y_pred_seq = y_pred_np[:, i] # 直接對應 [0, 1]
+            y_pred_seq = y_pred_np[:, i] 
 
             r2, mse = calculate_metrics(y_true_seq, y_pred_seq)
             
@@ -245,15 +249,16 @@ def visualize():
             plt.plot(time_steps, y_pred_seq, 'r--', linewidth=2, label=f"Pred {col_name}")
             
             plt.title(f"{col_name} | R²: {r2*100:.2f}% | MSE: {mse:.5f}")
-            plt.legend()
+            plt.legend(loc="upper right")
             plt.grid(True, alpha=0.3)
             
             if i == len(target_cols) - 1:
                 plt.xlabel("Time [s]")
 
         plt.tight_layout()
+        plt.subplots_adjust(top=0.95) 
         filename = f"pred_{ep_id}.png"
-        plt.savefig(os.path.join(output_dir, filename))
+        plt.savefig(os.path.join(output_dir, filename), dpi=150)
         plt.close()
         print(f"Saved {filename}")
 

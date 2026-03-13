@@ -180,12 +180,11 @@ class IsaacMotorTest(Node):
     def __init__(self):
         super().__init__('isaac_motor_test')
 
-        self.target_names = ["Motor", "Joint"]
         self.subscription = self.create_subscription(JointState, '/joint_states', self.listener_callback, 10)
         self.get_logger().info("已啟動：關節狀態監聽中...")
 
-        self.topic_name = '/motor_control'
-        self.publisher_ = self.create_publisher(Float64, self.topic_name, 10)
+        self.topic_name = '/joint_command'
+        self.publisher_ = self.create_publisher(JointState, self.topic_name, 10)
 
         self.dt = 0.05
         self.timer = self.create_timer(self.dt, self.timer_callback)
@@ -194,40 +193,52 @@ class IsaacMotorTest(Node):
         self.test_duration = 0.05 
         self.phase_timer = 0.0     
 
-        self.current_joint_pos = 0.0
         self.current_motor_pos = 0.0
+        self.current_joint_pos = 0.0
+        self.current_joint2_pos = 0.0
         
         self.empiric_gain = 0.7 
 
         self.get_logger().info(f"已啟動：速度發送中 -> {self.topic_name}")
 
+    def send_command(self, u):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = ['motor']  
+        msg.velocity = [float(u)]
+        self.publisher_.publish(msg)
+
     def listener_callback(self, msg):
         output_str = ""
         found_any = False 
 
-        for target in self.target_names:
-            if target in msg.name:
-                idx = msg.name.index(target)
-                pos = msg.position[idx]
-                vel = msg.velocity[idx]
+        for i, target in enumerate(msg.name):
+            n = target.lower()
+            pos = msg.position[i]
+            vel = msg.velocity[i]
 
-                if target == "Joint":
-                    self.current_joint_pos = pos
-                elif target == "Motor":
-                    self.current_motor_pos = pos
-                
-                output_str += f"[{target}] 角:{pos:.2f} 速:{vel:.2f} | "
+            if n == "motor":
+                self.current_motor_pos = pos
+                output_str += f"[M]角:{pos:.2f}速:{vel:.2f}|"
+                found_any = True
+            elif n == "joint" or n == "joint1":
+                self.current_joint_pos = pos
+                output_str += f"[J1]角:{pos:.2f}速:{vel:.2f}|"
+                found_any = True
+            elif n == "joint2":
+                self.current_joint2_pos = pos
+                output_str += f"[J2]角:{pos:.2f}速:{vel:.2f}|"
                 found_any = True
 
         if found_any:
-            print(f"📥 [狀態] {output_str}", end='\r')
+            print(f"📥[狀態]{output_str}", end='\r')
 
-    def timer_callback(self):     
-        msg = Float64()
-        fail_joint = abs(self.current_joint_pos) > JOINT_LIMIT
+    def timer_callback(self):    
         fail_motor = abs(self.current_motor_pos) > MOTOR_LIMIT
+        fail_joint1 = abs(self.current_joint_pos) > JOINT_LIMIT
+        fail_joint2 = abs(self.current_joint2_pos) > JOINT_LIMIT
         
-        if fail_joint or fail_motor:
+        if fail_motor or fail_joint1 or fail_joint2:
             print(f"\n\n🚨 測試結束！已獲得充分數據。")
 
             limit_hit = MOTOR_LIMIT if fail_motor else JOINT_LIMIT
@@ -237,24 +248,21 @@ class IsaacMotorTest(Node):
             ideal_distance = TEST_SPEED * safe_duration
             self.empiric_gain = limit_hit / ideal_distance
             
-            # --- 乾淨俐落的印出 ---
             print("\n" + "="*50)
             print(" 📊 動態增益測試結果")
             print("="*50)
             print(f"🔹 建議 VEL_TO_POS_GAIN = {self.empiric_gain:.3f}")
             print("="*50 + "\n")
             
-            msg.data = 0.0
-            self.publisher_.publish(msg)
+            self.send_command(0.0)
             self.state = "STOP"
             raise SystemExit
             
         if self.state == "RUN_POS":
             if self.phase_timer < self.test_duration:
-                msg.data = TEST_SPEED 
+                self.send_command(TEST_SPEED)
                 self.phase_timer += self.dt
             else:
-                # 結算 Gain = 當前馬達位置 / (速度 * 時間)
                 if self.test_duration > 0:
                     self.empiric_gain = abs(self.current_motor_pos) / (TEST_SPEED * self.test_duration)
                 self.state = "RUN_NEG"
@@ -262,13 +270,14 @@ class IsaacMotorTest(Node):
 
         elif self.state == "RUN_NEG":
             if self.phase_timer < self.test_duration:
-                msg.data = -TEST_SPEED 
+                self.send_command(-TEST_SPEED)
                 self.phase_timer += self.dt
             else:
                 self.state = "RESET"
                 self.phase_timer = 0.0
-                msg.data = 0.0
-                print(f"\n✅ 通過 {self.test_duration:.2f}s (Joint:{abs(self.current_joint_pos):.2f}) -> 歸零中...")
+                self.send_command(0.0)
+                max_j = max(abs(self.current_motor_pos), abs(self.current_joint_pos), abs(self.current_joint2_pos))
+                print(f"\n✅ 通過 {self.test_duration:.2f}s (Max:{max_j:.2f}) -> 歸零中...")
 
         elif self.state == "RESET":
             error = 0.0 - self.current_motor_pos
@@ -277,7 +286,7 @@ class IsaacMotorTest(Node):
             if control_effort > RESET_MAX_SPEED: control_effort = RESET_MAX_SPEED
             elif control_effort < -RESET_MAX_SPEED: control_effort = -RESET_MAX_SPEED
             
-            msg.data = control_effort
+            self.send_command(control_effort)
 
             if self.phase_timer < RESET_DURATION:
                 self.phase_timer += self.dt
@@ -287,21 +296,17 @@ class IsaacMotorTest(Node):
                 self.test_duration += 0.05 
                 
         elif self.state == "STOP":
-            msg.data = 0.0
-
-        self.publisher_.publish(msg)
+            self.send_command(0.0)
 
 class IsaacDataCollector(Node):
     def __init__(self, mode='train'):
         super().__init__('isaac_data_collector')
         
-        # 統一使用外部載入的 config
         self.cfg = cfg
         self.mode = mode
 
         if self.mode == 'test':
             print(f"\n[Mode] 測試模式")
-            # 覆蓋為測試需要的短回合長度
             self.cfg.total_episodes = 10
             self.cfg.episode_len = 1000
             self.cfg.reset_len = 100
@@ -327,12 +332,18 @@ class IsaacDataCollector(Node):
         self.current_signal = build_signal_from_info(self.cfg, self.episode_schedule[0]) if self.episode_schedule else np.zeros(self.cfg.episode_len)
         self.history_cmd = []
         self.history_state = []
+        
         self.current_pos = 0.0
+        self.current_vel = 0.0
         self.current_joint_pos = 0.0
         self.current_joint_vel = 0.0
+        self.current_joint2_pos = 0.0
+        self.current_joint2_vel = 0.0
+        self.has_joint2 = False
 
         self.sub = self.create_subscription(JointState, '/joint_states', self.listener_callback, 10)
-        self.pub = self.create_publisher(Float64, '/motor_control', 10)
+        self.pub = self.create_publisher(JointState, '/joint_command', 10)
+
         self.timer = self.create_timer(self.cfg.dt, self.timer_callback)
         self.start_time = self.get_clock().now().nanoseconds
         print(f"--- 開始蒐集 ({len(self.episode_schedule)} 回合) ---")
@@ -343,24 +354,35 @@ class IsaacDataCollector(Node):
     def listener_callback(self, msg):
         current_t = self.get_time_sec()
         found = False
-        p1 = v1 = p2 = v2 = 0.0
         
-        if "Motor" in msg.name: 
-            idx = msg.name.index("Motor")
-            p1, v1 = msg.position[idx], msg.velocity[idx]
-            self.current_pos = p1
-            found = True
-        if "Joint" in msg.name: 
-            idx = msg.name.index("Joint")
-            p2, v2 = msg.position[idx], msg.velocity[idx]
-            self.current_joint_pos = p2
-            self.current_joint_vel = v2
+        for i, name in enumerate(msg.name):
+            n = name.lower()
+            if n == "motor": 
+                self.current_pos = msg.position[i]
+                self.current_vel = msg.velocity[i]
+                found = True
+            elif n == "joint" or n == "joint1": 
+                self.current_joint_pos = msg.position[i]
+                self.current_joint_vel = msg.velocity[i]
+                found = True
+            elif n == "joint2":
+                self.current_joint2_pos = msg.position[i]
+                self.current_joint2_vel = msg.velocity[i]
+                self.has_joint2 = True
+                found = True
 
-            if abs(p2) > REAL_HARD_LIMIT:
-                self.hard_limit_count += 1
+        if abs(self.current_pos) > REAL_HARD_LIMIT or \
+           abs(self.current_joint_pos) > REAL_HARD_LIMIT or \
+           (self.has_joint2 and abs(self.current_joint2_pos) > REAL_HARD_LIMIT):
+            self.hard_limit_count += 1
             
         if found: 
-            self.history_state.append([current_t, p1, v1, p2, v2])
+            self.history_state.append([
+                current_t, 
+                self.current_pos, self.current_vel, 
+                self.current_joint_pos, self.current_joint_vel,
+                self.current_joint2_pos, self.current_joint2_vel
+            ])
 
     def timer_callback(self):
         if self.current_episode >= self.cfg.total_episodes: 
@@ -429,8 +451,10 @@ class IsaacDataCollector(Node):
         self.global_step_counter += 1
 
     def send_command(self, u): 
-        msg = Float64()
-        msg.data = float(u)
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = ['motor']  
+        msg.velocity = [float(u)]
         self.pub.publish(msg)
         
     def finish_and_save(self): 
@@ -455,18 +479,27 @@ class IsaacDataCollector(Node):
         
         y_aligned = interp1d(t_state, y_state, axis=0, kind='linear', fill_value="extrapolate")(cmd_data[:, 0])
         
-        df = pd.DataFrame({
+        df_dict = {
             "time_actual": cmd_data[:, 0], 
             "time_ideal": cmd_data[:, 1], 
             "episode_id": cmd_data[:, 3], 
             "input_u": cmd_data[:, 2], 
             "pos_motor": y_aligned[:, 0], 
             "vel_motor": y_aligned[:, 1], 
-            "pos_joint": y_aligned[:, 2], 
-            "vel_joint": y_aligned[:, 3]
-        })
+            "pos_joint1": y_aligned[:, 2], 
+            "vel_joint1": y_aligned[:, 3]
+        }
         
-        exceed_mask = np.abs(df["pos_joint"]) > REAL_HARD_LIMIT
+        if self.has_joint2:
+            df_dict["pos_joint2"] = y_aligned[:, 4]
+            df_dict["vel_joint2"] = y_aligned[:, 5]
+
+        df = pd.DataFrame(df_dict)
+        
+        exceed_mask = (np.abs(df["pos_motor"]) > REAL_HARD_LIMIT) | (np.abs(df["pos_joint1"]) > REAL_HARD_LIMIT)
+        if self.has_joint2:
+            exceed_mask = exceed_mask | (np.abs(df["pos_joint2"]) > REAL_HARD_LIMIT)
+            
         hard_exceed_count = np.sum(exceed_mask)
         failed_episodes = df[exceed_mask]["episode_id"].unique().astype(int).tolist()
         
