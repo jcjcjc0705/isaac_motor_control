@@ -82,27 +82,35 @@ class NSSM(nn.Module):
 
 
 class CascadedSystem(nn.Module):
-    def __init__(self, state_dim, raw_input_dim, history_window):
+    def __init__(self, state_dim, raw_input_dim, history_window, output_dim):
         super().__init__()
+        self.output_dim = output_dim
 
         # Input: [u, diff] -> multiplier = 2
         self.feature_multiplier = 2
-        self.motor_input_dim = (raw_input_dim * self.feature_multiplier) * history_window
+        base_input_dim = (raw_input_dim * self.feature_multiplier) * history_window
 
-        self.motor_output_dim = 1
-        self.motor_net = NSSM(state_dim, self.motor_input_dim, output_dim=self.motor_output_dim)
+        self.stages = nn.ModuleList()
+        curr_input_dim = base_input_dim
 
-        self.joint_input_dim = self.motor_input_dim + self.motor_output_dim
-        self.joint_net = NSSM(state_dim, self.joint_input_dim, output_dim=1)
+        for i in range(output_dim):
+            # 每一個 Stage 都只預測 1 個維度 (一個關節)
+            self.stages.append(NSSM(state_dim, curr_input_dim, output_dim=1))
+            # 下一個 Stage 的輸入，必須包含上一個 Stage 預測出來的特徵 (所以維度 + 1)
+            curr_input_dim += 1
 
-    def forward(self, u_sequence, x_init_motor, x_init_joint):
-        pred_motor = self.motor_net(u_sequence, x_init_motor)
-        motor_feature = pred_motor.detach()
+    def forward(self, u_sequence, x_inits):
+        current_input = u_sequence
+        outputs = []
 
-        joint_input = torch.cat([u_sequence, motor_feature], dim=2)
-        pred_joint = self.joint_net(joint_input, x_init_joint)
+        for i in range(self.output_dim):
+            # 把當前的輸入餵給第 i 個網路
+            pred = self.stages[i](current_input, x_inits[i])
+            outputs.append(pred)
+            current_input = torch.cat([current_input, pred.detach()], dim=2)
 
-        return torch.cat([pred_motor, pred_joint], dim=2)
+        # 把所有階段的預測結果拼在一起回傳 [batch, seq_len, output_dim]
+        return torch.cat(outputs, dim=2)
 
 
 # --- Dataset ---
@@ -183,13 +191,18 @@ class MotorData(Dataset):
 # --- Helper Functions ---
 
 def calculate_r2(y_true, y_pred):
-    target_var = torch.var(y_true, unbiased=False)
-    if target_var < 1e-6:
-        target_var = 1.0
+    r2_total = 0.0
+    dim = y_true.shape[-1]
+    
+    for i in range(dim):
+        target_var = torch.var(y_true[:, :, i], unbiased=False)
+        if target_var < 1e-6:
+            target_var = 1.0
 
-    sse = torch.mean((y_true - y_pred) ** 2)
-    r2 = 1.0 - (sse / target_var)
-    return r2.item()
+        sse = torch.mean((y_true[:, :, i] - y_pred[:, :, i]) ** 2)
+        r2_total += 1.0 - (sse / target_var)
+        
+    return (r2_total / dim).item()
 
 
 def diff(x):
@@ -249,14 +262,18 @@ def train():
 
     print(f"--- Loading CSV from {DATA_FILE} ---")
     df = pd.read_csv(DATA_FILE)
+    df_cols = df.columns.tolist()
 
+    # --- 自動決定目標欄位 (兼容舊版與新版) ---
     input_cols = ["input_u"]
+    j1_name = "vel_joint1" if "vel_joint1" in df_cols else "vel_joint"
+    
     if OUTPUT_DIM == 2:
-        target_cols = ["vel_motor", "vel_joint"]
-    elif OUTPUT_DIM == 4:
-        target_cols = ["pos_motor", "vel_motor", "pos_joint", "vel_joint"]
+        target_cols = ["vel_motor", j1_name]
+    elif OUTPUT_DIM == 3:
+        target_cols = ["vel_motor", j1_name, "vel_joint2"]
     else:
-        raise ValueError(f"Unsupported OUTPUT_DIM: {OUTPUT_DIM}")
+        raise ValueError(f"目前架構不支援 OUTPUT_DIM = {OUTPUT_DIM} (請設定 2 或 3)")
 
     full_dataset = MotorData(df, input_cols, target_cols, SEQ_LEN, HISTORY_WINDOW, scaler=None)
 
@@ -278,13 +295,13 @@ def train():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    model = CascadedSystem(STATE_DIM, cfg.input_dim, HISTORY_WINDOW).to(device)
+    # 初始化動態 Cascaded System
+    model = CascadedSystem(STATE_DIM, cfg.input_dim, HISTORY_WINDOW, OUTPUT_DIM).to(device)
 
-    loss_fn = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = ExponentialLR(optimizer, gamma=LR_DECAY_GAMMA)
 
-    run_name = f"{cfg.run_name}_val_{int(time.time())}"
+    run_name = f"{cfg.run_name}_dim{OUTPUT_DIM}_val_{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
 
     print(f"--- 🚀 Launching TensorBoard (Background)... ---")
@@ -312,19 +329,15 @@ def train():
             y_batch = y_batch.to(device)
             curr_batch_size = u_batch.size(0)
 
-            x_init_motor = torch.zeros(curr_batch_size, STATE_DIM).to(device)
-            x_init_joint = torch.zeros(curr_batch_size, STATE_DIM).to(device)
+            # 動態產生 N 個初始隱藏狀態 (對應各個關節網路)
+            x_inits = [torch.zeros(curr_batch_size, STATE_DIM).to(device) for _ in range(OUTPUT_DIM)]
 
-            y_pred = model(u_batch, x_init_motor, x_init_joint)
+            y_pred = model(u_batch, x_inits)
 
-            y_true_motor = y_batch[:, :, 0]
-            y_pred_motor = y_pred[:, :, 0]
-            y_true_joint = y_batch[:, :, 1]
-            y_pred_joint = y_pred[:, :, 1]
-
-            loss_motor = torch.mean((y_true_motor - y_pred_motor) ** 2)
-            loss_joint = torch.mean((y_true_joint - y_pred_joint) ** 2)
-            loss = loss_motor + loss_joint
+            # 動態加總 Loss
+            loss = 0.0
+            for i in range(OUTPUT_DIM):
+                loss += torch.mean((y_batch[:, :, i] - y_pred[:, :, i]) ** 2)
 
             optimizer.zero_grad()
             loss.backward()
@@ -348,19 +361,13 @@ def train():
                 y_batch = y_batch.to(device)
                 curr_batch_size = u_batch.size(0)
 
-                x_init_motor = torch.zeros(curr_batch_size, STATE_DIM).to(device)
-                x_init_joint = torch.zeros(curr_batch_size, STATE_DIM).to(device)
+                x_inits = [torch.zeros(curr_batch_size, STATE_DIM).to(device) for _ in range(OUTPUT_DIM)]
 
-                y_pred = model(u_batch, x_init_motor, x_init_joint)
+                y_pred = model(u_batch, x_inits)
 
-                y_true_motor = y_batch[:, :, 0]
-                y_pred_motor = y_pred[:, :, 0]
-                y_true_joint = y_batch[:, :, 1]
-                y_pred_joint = y_pred[:, :, 1]
-
-                loss_motor = torch.mean((y_true_motor - y_pred_motor) ** 2)
-                loss_joint = torch.mean((y_true_joint - y_pred_joint) ** 2)
-                loss = loss_motor + loss_joint
+                loss = 0.0
+                for i in range(OUTPUT_DIM):
+                    loss += torch.mean((y_batch[:, :, i] - y_pred[:, :, i]) ** 2)
 
                 val_loss_sum += loss.item()
                 val_r2_sum += calculate_r2(y_batch, y_pred)
@@ -383,7 +390,7 @@ def train():
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), MODEL_SAVE_PATH)
-            print(f"  >>> Best Model Saved! Val Loss: {best_val_loss:.5f} (Acc: {avg_val_r2*100:.2f}%)")
+            print(f"   >>> Best Model Saved! Val Loss: {best_val_loss:.5f} (Acc: {avg_val_r2*100:.2f}%)")
 
         scheduler.step()
 
