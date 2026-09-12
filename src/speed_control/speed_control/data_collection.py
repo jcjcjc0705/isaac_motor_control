@@ -6,8 +6,9 @@ limits: the signal generators shape waveforms against a predicted drift, and
 this node aborts to a PD recovery controller if the real hardware still gets
 close to the wall.
 
-All parameters come from config.py. The only runtime choice is which dataset to
-record, which is asked interactively at startup.
+All parameters come from config.py. Two of them are asked interactively at
+startup instead: which dataset to record, and the effort_to_pos_gain the signal
+generators should shape their waveforms against.
 """
 
 import os
@@ -71,6 +72,7 @@ class DataCollectorNode(Node):
         print(f"Mode: {mode}")
         print(f"Episodes: {len(self.schedule)} x "
               f"({self.cfg.episode_len} excite + {self.cfg.reset_len} reset) steps")
+        print(f"effort_to_pos_gain: {self.cfg.effort_to_pos_gain}")
         # Absolute, because the paths in config are relative to the working
         # directory and this node is often launched from elsewhere.
         print(f"Output: {os.path.abspath(self.output_path)}")
@@ -137,12 +139,29 @@ class DataCollectorNode(Node):
             print(f"Progress: {self.episode_index}/{self.cfg.total_episodes} episodes, "
                   f"{len(self.command_log)} rows, {self.limit_hit_count} limit hits")
 
+    def report_progress(self, episode: int, phase: str, step_in_phase: int) -> None:
+        """Print where the command that just went out sits in the schedule.
+
+        The caller passes the position rather than reading it off self, because
+        on_timer may already have rolled the phase or the episode over by the
+        time this runs.
+        """
+        step_in_episode = step_in_phase
+        if phase == "RESET":
+            step_in_episode += self.cfg.episode_len
+        print(f"Step {self.global_step}: "
+              f"episode {episode}/{self.cfg.total_episodes}, "
+              f"step {step_in_episode}/{self.cfg.seq_len} ({phase})")
+
     def on_timer(self) -> None:
         if self.episode_index >= self.cfg.total_episodes:
             self.finish()
             return
 
+        # Captured before the phase and episode counters below can move on.
         recorded_episode = self.episode_index
+        recorded_phase = self.phase
+        recorded_step = self.step_in_phase
         signal_type = self.schedule[recorded_episode].signal_type
 
         if self.phase == "EXCITE":
@@ -169,6 +188,8 @@ class DataCollectorNode(Node):
             effort,
             signal_type,
         ])
+        if self.global_step % self.cfg.progress_every == 0:
+            self.report_progress(recorded_episode, recorded_phase, recorded_step)
         self.global_step += 1
 
     # ------------------------------------------------------------------
@@ -247,6 +268,30 @@ def prompt_mode() -> str:
     return input("Choice [1/2/3]: ").strip()
 
 
+def prompt_gain(cfg=DEFAULT_CONFIG) -> float:
+    """Ask for effort_to_pos_gain, empty input keeping the configured value.
+
+    Asked before the node is built because the signal generators size every
+    waveform against this gain while the schedule is being laid out, so it is
+    too late to change once DataCollectorNode exists.
+    """
+    while True:
+        raw = input(f"effort_to_pos_gain [{cfg.effort_to_pos_gain}]: ").strip()
+        if not raw:
+            return cfg.effort_to_pos_gain
+        try:
+            value = float(raw)
+        except ValueError:
+            print("  Not a number")
+            continue
+        # Zero would divide by zero in the PRBS hold-length calculation, and a
+        # negative gain would point the predicted drift the wrong way.
+        if value <= 0:
+            print("  Must be greater than zero")
+            continue
+        return value
+
+
 def main(args=None) -> None:
     choice = prompt_mode()
 
@@ -254,7 +299,8 @@ def main(args=None) -> None:
         run_node(GainCalibrationNode, args)
     else:
         mode = TEST_MODE if choice == "2" else TRAIN_MODE
-        run_node(lambda: DataCollectorNode(mode=mode), args)
+        cfg = replace(DEFAULT_CONFIG, effort_to_pos_gain=prompt_gain())
+        run_node(lambda: DataCollectorNode(cfg=cfg, mode=mode), args)
 
 
 if __name__ == "__main__":

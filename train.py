@@ -50,6 +50,14 @@ def launch_tensorboard(config) -> None:
         print(f"Warning: could not start TensorBoard: {error}")
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 def sequence_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     """Sum of per-channel mean squared error over the whole rollout."""
     return sum(
@@ -58,15 +66,22 @@ def sequence_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     )
 
 
-def run_epoch(model, loader, device, optimizer=None):
-    """Run one pass. Passing an optimizer switches to training mode."""
+def run_epoch(model, loader, device, optimizer=None, progress_label=None):
+    """Run one pass. Passing an optimizer switches to training mode.
+
+    ``progress_label`` turns on a per-batch line that is overwritten in place,
+    so a long epoch visibly moves without filling the scrollback. It is skipped
+    when stdout is not a terminal, which keeps redirected logs readable.
+    """
     is_training = optimizer is not None
     model.train(is_training)
 
+    show_progress = progress_label is not None and sys.stdout.isatty()
+    batches = len(loader)
     loss_sum = 0.0
     r2_sum = 0.0
     with torch.set_grad_enabled(is_training):
-        for u_batch, y_batch in loader:
+        for index, (u_batch, y_batch) in enumerate(loader, start=1):
             u_batch = u_batch.to(device)
             y_batch = y_batch.to(device)
 
@@ -81,7 +96,16 @@ def run_epoch(model, loader, device, optimizer=None):
             loss_sum += loss.item()
             r2_sum += r2_score(y_batch.detach(), y_pred.detach())
 
-    return loss_sum / len(loader), r2_sum / len(loader)
+            if show_progress:
+                print(f"\r  {progress_label} batch {index}/{batches} "
+                      f"loss {loss_sum / index:.5f} R2 {r2_sum / index * 100:.1f}%",
+                      end="", flush=True)
+
+    if show_progress:
+        # Erase the transient line so the epoch summary starts on a clean row.
+        print("\r\033[K", end="", flush=True)
+
+    return loss_sum / batches, r2_sum / batches
 
 
 def train() -> None:
@@ -135,20 +159,34 @@ def train() -> None:
             launch_tensorboard(cfg)
 
     best_val_loss = float("inf")
-    print("Training start")
+    print(f"Training start: {cfg.epochs} epochs, "
+          f"{len(train_loader)} train + {len(val_loader)} val batches per epoch")
+    training_start = time.time()
     for epoch in range(cfg.epochs):
-        train_loss, train_r2 = run_epoch(model, train_loader, device, optimizer)
-        val_loss, val_r2 = run_epoch(model, val_loader, device)
+        epoch_start = time.time()
+        label = f"Epoch {epoch + 1}/{cfg.epochs}"
+        train_loss, train_r2 = run_epoch(
+            model, train_loader, device, optimizer, progress_label=f"{label} train"
+        )
+        val_loss, val_r2 = run_epoch(
+            model, val_loader, device, progress_label=f"{label} val"
+        )
+        epoch_seconds = time.time() - epoch_start
 
         if writer is not None:
             writer.add_scalars("Loss", {"Train": train_loss, "Val": val_loss}, epoch)
             writer.add_scalars("Accuracy_R2", {"Train": train_r2, "Val": val_r2}, epoch)
 
         if (epoch + 1) % cfg.log_every == 0:
+            # Remaining time from the mean epoch so far, not the last one, which
+            # is noisy enough on a shared GPU to make the estimate jump around.
+            mean_epoch = (time.time() - training_start) / (epoch + 1)
+            eta = mean_epoch * (cfg.epochs - epoch - 1)
             print(f"Epoch [{epoch + 1}/{cfg.epochs}] "
                   f"loss {train_loss:.5f}/{val_loss:.5f} "
                   f"R2 {train_r2 * 100:.1f}%/{val_r2 * 100:.1f}% "
-                  f"lr {optimizer.param_groups[0]['lr']:.2e}")
+                  f"lr {optimizer.param_groups[0]['lr']:.2e} "
+                  f"{epoch_seconds:.1f}s ETA {format_duration(eta)}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -160,7 +198,8 @@ def train() -> None:
 
     if writer is not None:
         writer.close()
-    print(f"Training finished. Best val loss: {best_val_loss:.6f}")
+    print(f"Training finished in {format_duration(time.time() - training_start)}. "
+          f"Best val loss: {best_val_loss:.6f}")
     print(f"Model: {os.path.abspath(cfg.model_save_path)}")
 
 

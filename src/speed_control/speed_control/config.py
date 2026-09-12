@@ -34,6 +34,7 @@ class ExperimentConfig:
     reset_len: int = 100        # settling steps that drive the motor back to zero
     total_episodes: int = 500
     dt: float = 0.05            # control period in seconds, 20 Hz
+    progress_every: int = 100   # command steps between collection progress lines
 
     # ------------------------------------------------------------------
     # CSV schema
@@ -125,7 +126,7 @@ class ExperimentConfig:
     viz_include_test: bool = True
     viz_test_start: int = 8800          # first row sliced out of the test CSV
     viz_test_len: Optional[int] = 1100  # None means "to the end of the file"
-    viz_channels: Tuple[int, ...] = (1, 3)  # target_cols indices: vel_motor, vel_joint1
+    viz_channels: Tuple[int, ...] = (0, 1, 2, 3)  # target_cols indices: all four channels
 
     # ------------------------------------------------------------------
     # Data inspection (plot_data.py)
