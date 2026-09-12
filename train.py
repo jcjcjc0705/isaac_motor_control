@@ -1,7 +1,15 @@
 """Train the cascaded NSSM on collected motor data.
 
-All settings come from src/speed_control/speed_control/config.py. Edit that file
-and re-run; this script takes no command-line arguments.
+Reads ``cfg.data_file``, writes the checkpoint and scaler named by the config,
+and logs scalars to runs/ for TensorBoard.
+
+Usage:
+
+    python train.py
+    tensorboard --logdir runs
+
+All settings come from src/speed_control/speed_control/config.py. Edit that
+file and re-run; this script takes no command-line arguments.
 """
 
 import os
@@ -70,8 +78,8 @@ def run_epoch(model, loader, device, optimizer=None, progress_label=None):
     """Run one pass. Passing an optimizer switches to training mode.
 
     ``progress_label`` turns on a per-batch line that is overwritten in place,
-    so a long epoch visibly moves without filling the scrollback. It is skipped
-    when stdout is not a terminal, which keeps redirected logs readable.
+    so a long epoch visibly moves without filling the scrollback. It is printed
+    only when stdout is a terminal, leaving redirected logs clean.
     """
     is_training = optimizer is not None
     model.train(is_training)
@@ -178,8 +186,8 @@ def train() -> None:
             writer.add_scalars("Accuracy_R2", {"Train": train_r2, "Val": val_r2}, epoch)
 
         if (epoch + 1) % cfg.log_every == 0:
-            # Remaining time from the mean epoch so far, not the last one, which
-            # is noisy enough on a shared GPU to make the estimate jump around.
+            # ETA from the mean epoch so far, which is steadier than taking the
+            # most recent epoch alone.
             mean_epoch = (time.time() - training_start) / (epoch + 1)
             eta = mean_epoch * (cfg.epochs - epoch - 1)
             print(f"Epoch [{epoch + 1}/{cfg.epochs}] "

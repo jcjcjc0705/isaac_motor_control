@@ -7,6 +7,9 @@
 ## 流程總覽
 
 ```
+isaac_scripts/actuator_model.py  把致動器阻尼寫進 USD，由模擬器每個物理步施加
+        |
+        v
 Isaac Sim (isaac_motor_usd/*.usd)
         |  ROS 2: 發布 effort 到 /joint_command，訂閱 /joint_states
         v
@@ -23,6 +26,9 @@ visualize_model.py  開迴路預測並與真值比對
         |
         v  plots/pred_*.png
 ```
+
+阻尼由模擬器內部施加，收資料的 node 只負責送出激勵命令。ROS 這條路徑有往返延遲，
+把速度回饋放在外面會讓阻尼在連桿的自然頻率附近變成能量來源。
 
 ## 環境需求
 
@@ -90,18 +96,20 @@ src/speed_control/speed_control/config.py
 |---|---|---|
 | 路徑 | `data_file`, `test_file`, `model_dir` | 輸入輸出位置；模型與 scaler 檔名由 `data_file` 自動推導 |
 | 回合結構 | `episode_len`, `reset_len`, `total_episodes`, `dt` | 每回合 = 激勵段 + 歸零段，`seq_len` 為兩者之和 |
+| 取樣 | `record_decimation`, `progress_every` | 每幾筆 `/joint_states` 記錄一列、每幾列印一次進度 |
 | CSV 欄位 | `input_cols`, `target_cols` | `output_dim` 由 `target_cols` 長度自動推導 |
 | 模型 | `state_dim`, `history_window` | 狀態階數與堆疊的歷史命令步數 |
 | 訓練 | `batch_size`, `learning_rate`, `epochs`, `val_ratio`, `seed`, `deterministic` | `deterministic=True` 會開啟 cuDNN 決定性，較慢但可重現 |
-| 激勵訊號 | `amplitude`, `signal_mix`, `signal_ranges` | 各訊號種類的配比與參數範圍 |
+| 激勵訊號 | `signal_mix`, `signal_ranges` | 各訊號種類的配比與參數範圍；振幅由 `effort_to_pos_gain` 推導，不是設定值 |
 | 安全極限 | `hard_limit`, `abort_limit`, `planner_safe_limit`, `effort_to_pos_gain` | 見下方「安全機制」 |
-| 歸零控制 | `reset_kp`, `reset_kd`, `max_effort` | 把馬達拉回 0 的 PD 控制器 |
+| 歸零控制 | `reset_kp`, `reset_kd`, `max_effort` | 歸零段與中止後把馬達交給誰處理 |
+| 增益校正 | `calib_start_effort`, `calib_effort_step`, `calib_effort`, `calib_limit` | 模式 3 的施力範圍與中止角度 |
 | 可視化 | `viz_train_episodes`, `viz_test_start`, `viz_channels` | 要畫哪些回合、測試檔切片範圍、要畫哪些通道 |
 | 資料檢視 | `inspect_file`, `inspect_episode_id` | plot_data.py 的分析對象 |
 
 ## 操作步驟
 
-步驟 1 至 4 在 ROS 終端機執行，步驟 5 至 7 在 conda 終端機執行，
+步驟 1 至 5 在 ROS 終端機執行，步驟 6 至 8 在 conda 終端機執行，
 兩者都從 repo 根目錄啟動。
 
 ### 1. 建置 ROS package（ROS 終端機）
@@ -111,18 +119,48 @@ colcon build --packages-select speed_control
 source install/setup.bash
 ```
 
-### 2. 啟動 Isaac Sim（ROS 終端機）
+### 2. 準備 Isaac Sim 場景
 
 開啟 `isaac_motor_usd/` 下的場景（`motor_sim_oneJoint.usd` / `motor_sim_twoJoint.usd` /
-`motor_sim_threeJoint.usd`），啟用 ROS 2 Bridge 後按下 Play。
+`motor_sim_threeJoint.usd`），確認 Action Graph 具備：
 
-確認 topic 已連通：
+- `ROS2PublishJointState`，發布 `/joint_states`
+- `IsaacArticulationController`，訂閱 `/joint_command` 並以 effort 驅動
+- 一個 Script Node，用來執行致動器模型（見步驟 3）
 
-```bash
-ros2 topic echo /joint_states --once
+每個要模擬阻尼的關節，把 `drive:angular:physics:damping` 與
+`physxJoint:jointFriction` 都設為 0，阻尼一律交給致動器模型提供。
+場景中需有一個 prim 帶 `ArticulationRootAPI`。
+
+### 3. 掛上致動器模型（換模型或改參數時才需要）
+
+`isaac_scripts/actuator_model.py` 提供關節的黏滯阻尼、庫倫摩擦與力矩上限，
+在模擬器內部每個物理步施加，回報的關節速度不受影響。
+
+在 Action Graph 內自行拉一個 Script Node、把 tick node 接到它的 Exec In，
+然後編輯檔案末端的區塊：
+
+```python
+apply_actuator(
+    joint_path = "/World/Cylinder/motor",   # 右鍵 -> Copy Prim Path
+    b_viscous  = 0.3,                       # 黏滯阻尼 (N*m*s/rad)
+    b_coulomb  = 0.0,                       # 與速度無關的乾摩擦 (N*m)
+    max_torque = 2.0,                       # 此關節的力矩上限 (N*m)
+)
+
+install(
+    script_node_path = "/World/ActionGraph/script_node",
+)
 ```
 
-### 3. 校正 effort_to_pos_gain（ROS 終端機，換場景時才需要）
+把整份檔案貼進 Window > Script Editor 執行一次，存檔（Ctrl+S），再按 Stop 與 Play。
+程式碼會寫進 Script Node 的 `inputs:script`，也就是存在 USD 裡，因此執行過後這個
+檔案可以搬走或刪除，場景仍能運作；要改係數或換關節時再執行一次即可。
+
+多關節就多寫幾個 `apply_actuator(...)` 區塊，不需要的係數整行刪掉即可。
+執行後每個關節會印出 `[OK]` 與解析到的 body、axis，可據此確認路徑正確。
+
+### 4. 校正 effort_to_pos_gain（換機構時必做）
 
 ```bash
 ros2 run speed_control data_collector     # 選 3
@@ -130,11 +168,18 @@ ros2 run speed_control data_collector     # 選 3
 ros2 run speed_control gain_calibration
 ```
 
-以固定力矩脈衝反覆試探，脈衝時間逐輪加長，直到某個關節超過 `calib_limit`。
-程式會用最後一次沒撞牆的脈衝反推增益，把印出的數值填回 config 的
-`effort_to_pos_gain`。這個值決定訊號產生器預估漂移量的準確度。
+持續施加一個固定力矩，等關節停下後讀取重力與力矩平衡的角度，再把力矩加一階，
+直到某個關節到達 `calib_limit`。角度對力矩的斜率就是增益。輸出兩個值：
 
-### 4. 蒐集資料（ROS 終端機）
+- **equilibrium gain** —— 平衡角度的斜率，機構本身的增益
+- **peak gain** —— 含途中過衝的斜率，這是 `effort_to_pos_gain` 要用的值
+
+訊號產生器問的是「一段波形會把關節甩到多遠」，所以要用含過衝的 peak gain。
+
+這個增益描述的是機構本身（連桿、質量、摩擦），改動任何一項就得重測。
+激勵振幅由它推導而來，所以重測這一個數字就足以讓整輪收集留在行程內。
+
+### 5. 蒐集資料（ROS 終端機）
 
 ```bash
 ros2 run speed_control data_collector     # 選 1 收訓練資料，選 2 收測試資料
@@ -143,20 +188,26 @@ ros2 run speed_control data_collector     # 選 1 收訓練資料，選 2 收測
 - 選 1：依 `signal_mix` 產生 `total_episodes` 個回合，寫入 `data_file`
 - 選 2：以 `test_signal_type` 產生 `test_episodes` 個長回合，寫入 `test_file`
 
-選 1 或 2 之後會再問一次 `effort_to_pos_gain`，直接按 Enter 就用 config 的值：
+兩種模式都會先問 `effort_to_pos_gain`，填入步驟 4 量到的 peak gain，
+直接按 Enter 則採用 config 的預設值：
 
 ```
-effort_to_pos_gain [0.01]:
+effort_to_pos_gain [1.15]:
 ```
 
-換場景試增益時不必反覆改 config 存檔。實際採用的值會印在啟動摘要裡，
-在第一個命令送出之前。這個值在排程建立時就要定案，所以只能在這裡問，
-不能等 node 起來之後再改。
+接著會印出這個增益推導出的振幅與預測擺幅，可在送出第一個命令前確認合理：
 
-這是唯一需要互動的步驟，因為「要收哪一份資料」與「用哪個增益」都是執行時的
-選擇而非參數。兩種模式都會直接覆寫目標檔案，不會產生時間戳檔名。
+```
+  effort_to_pos_gain   : 1.150 rad per unit effort
+  excitation amplitude : 1.000 effort units (derived, not configured)
+  predicted excursion  : 1.150 rad (65.9 deg), against a 1.570 rad limit
+```
 
-### 5. 檢查資料品質（conda 終端機）
+這個值在排程建立時就要定案，所以只能在這裡問，不能等 node 起來之後再改。
+收集開始前 node 會先等機構完全靜止，因為訓練是以零初始狀態展開每個回合的。
+兩種模式都會直接覆寫目標檔案，不會產生時間戳檔名。
+
+### 6. 檢查資料品質（conda 終端機）
 
 ```bash
 python3 plot_data.py
@@ -164,16 +215,17 @@ python3 plot_data.py
 
 輸出超限統計與 `data/<name>_analysis.png`（單回合速度、單回合位置、全場總覽）。
 
-### 6. 訓練（conda 終端機）
+### 7. 訓練（conda 終端機）
 
 ```bash
 python3 train.py
+tensorboard --logdir runs
 ```
 
 輸出最佳模型到 `models/`、scaler 到 `scalers/`、TensorBoard log 到 `runs/`。
 把 config 的 `launch_tensorboard` 設為 `True` 可在訓練開始時自動啟動 TensorBoard。
 
-### 7. 檢視預測結果（conda 終端機）
+### 8. 檢視預測結果（conda 終端機）
 
 ```bash
 python3 visualize_model.py
@@ -185,7 +237,7 @@ python3 visualize_model.py
 ## 目錄結構
 
 ```
-motor_control/
+isaac_motor_control/
 ├── README.md
 ├── requirements.txt               訓練端依賴（pip）
 ├── environment.yml                訓練端依賴（conda）
@@ -193,31 +245,30 @@ motor_control/
 ├── visualize_model.py             開迴路預測與繪圖
 ├── plot_data.py                   資料品質檢查
 ├── isaac_motor_usd/               Isaac Sim 場景
+├── isaac_scripts/
+│   └── actuator_model.py          致動器模型，寫入 USD 的 Script Node
 └── src/speed_control/speed_control/
     ├── config.py                  唯一設定來源
     ├── signals.py                 激勵訊號產生與回合排程（不依賴 ROS）
-    ├── joint_state.py             /joint_states 解析，兩個 node 共用
-    ├── node_runner.py             node 啟動與關閉，兩個 node 共用
+    ├── joint_state.py             /joint_states 解析與 /joint_command 組裝
+    ├── node_runner.py             node 啟動與關閉
     ├── data_collection.py         資料收集 node
     ├── limit_test.py              增益校正 node
     ├── features.py                特徵建構與正規化，訓練與推論共用
-    ├── model.py                   NSSM 與 CascadedSystem，唯一定義處
+    ├── model.py                   NSSM 與 CascadedSystem
     ├── dataset.py                 回合資料集與分層切分
     └── metrics.py                 R2 與 MSE
 ```
 
-### 為什麼要拆這麼多檔
-
-- `model.py` 與 `features.py` 被訓練和推論兩邊共用。先前這兩段程式碼各有一份複製，
-  改動其中一邊就會讓推論與訓練不一致 —— 特徵那份尤其危險，因為張量維度不變，
-  不會拋出任何錯誤，只會讓 R2 莫名下降。
-- `signals.py` 不 import ROS，所以可以不開模擬器就產生並檢視波形，方便調參。
+`model.py`、`features.py`、`metrics.py` 由訓練與推論兩邊共用，兩條路徑因此建出
+相同的架構、相同的特徵、相同的分數。`signals.py` 不 import ROS，可以不開模擬器
+就產生並檢視波形。
 
 ## 資料格式
 
 | 欄位 | 說明 |
 |---|---|
-| `time_actual` | 從節點啟動起算的實際秒數 |
+| `time_actual` | 模擬器時鐘，從收集開始起算的秒數 |
 | `time_ideal` | `global_step * dt`，理想時間軸 |
 | `episode_id` | 回合編號，從 0 起 |
 | `input_u` | 送出的力矩命令 |
@@ -226,8 +277,11 @@ motor_control/
 | `pos_joint1`, `vel_joint1` | 第一連桿位置與速度 |
 | `pos_joint2`, `vel_joint2` | 第二連桿，僅在場景提供時才有 |
 
-`/joint_states` 走模擬器的時鐘，與命令 timer 並不同步，因此存檔前會把狀態
-線性內插到命令的時間軸上，兩者才能共用同一列。
+每一筆 `/joint_states` 就是一個控制步，每 `record_decimation` 筆記錄一列，
+所以命令與狀態出自同一筆訊息，一列只需要一個時間戳，不需要內插對齊。
+node 跟著模擬器的時鐘走，模擬器跑得慢只會花掉更多實際時間，不會少收資料。
+
+位置在解析時就折疊到 ±π，因此控制器、統計與存檔看到的是同一個角度。
 
 ## 模型架構
 
@@ -243,7 +297,7 @@ u_seq --> [stage_motor] --> pred_motor (pos_motor, vel_motor)
 ```
 
 連桿段會看到馬達段的預測，但該張量經過 `detach()`，所以連桿的誤差不會回傳到
-馬達模型，兩段實際上是各自獨立學習的。
+馬達模型，兩段各自獨立學習。
 
 單段 `NSSM` 為離散時間非線性狀態空間模型：
 
@@ -262,37 +316,49 @@ x_{t+1} = (1 - a) x_t + a f(x_t, u_t)
 
 行程保護分三層，由寬到緊：
 
-1. **`planner_safe_limit`（1.2 rad）** —— 訊號產生器的虛擬牆。每段波形產生後會先用
-   一個粗略的一階模型預估位置漂移，超過就整體等比例縮小。PRBS 則是直接限制每段
-   的持續步數。
-2. **`abort_limit`（1.4 rad）** —— 執行期即時保護。收集過程中每步用 `lookahead`
-   秒做前瞻預測，一旦當前或預測位置越界，立刻放棄該回合剩餘的激勵訊號，
-   切換成 PD 控制把馬達拉回零點。
-3. **`hard_limit`（1.57 rad，90 度）** —— 真實機構極限，僅用於事後統計。
-   存檔時會報告有多少列、哪些回合曾經超過此值。
+1. **`planner_safe_limit`（1.2 rad）** —— 訊號產生器的規劃上限。持續施加一個力矩時，
+   關節會停在重力與之平衡的角度，所以擺幅取決於命令的峰值而非積分，預估只是一個
+   乘法：`effort_to_pos_gain × max|u|`。超過就整段等比例縮小。
+2. **`abort_limit`（1.4 rad）** —— 執行期即時保護。每步用 `lookahead` 秒做前瞻預測，
+   一旦當前或預測位置越界，立刻放棄該回合剩餘的激勵訊號，把馬達交給歸零控制器。
+3. **`hard_limit`（1.57 rad，90 度）** —— 機構行程極限，用於事後統計。
+   存檔時會報告有多少列、哪些回合曾經超過此值，以及是否出現非有限值。
+
+激勵振幅（`cfg.amplitude`）是推導值而非設定值：
+
+```
+amplitude = (planner_safe_limit - planner_margin) / effort_to_pos_gain
+```
+
+也就是「預測擺幅剛好填滿安全帶」的那個力矩。排程的隨機振幅因此都落在上限之下，
+規劃器沒有東西需要修剪；設得比它高不會換到更大行程，只會讓超過的回合全部被修剪成
+同一個振幅，失去振幅的多樣性。
+
+歸零控制器的 `reset_kp` 與 `reset_kd` 預設為 0，也就是不施力、讓關節靠自身摩擦
+滑行到停止。若機構無法自行停下再調高它們，但那會把歸零段變成一個經由模擬器往返
+的 PD 迴路，且每換一次機構就要重新調。
 
 ## 驗證集切分
 
 `stratified_split` 依 CSV 的 `signal_type` 欄位分層，每種訊號各自以固定間隔抽出
-驗證回合，因此無論 `val_ratio` 設成多少，四種訊號在驗證集中都會等比例出現。
+驗證回合，因此無論 `val_ratio` 設成多少，各種訊號在驗證集中都會等比例出現。
 
-若讀到的 CSV 沒有 `signal_type` 欄位（重構前收集的舊資料），程式會印出警告並
-依 `signal_mix` 的交錯順序回推種類。該回推只對交錯排程產生的資料有效，
-建議重新收集資料以移除這層猜測。
+若讀到的 CSV 沒有 `signal_type` 欄位，程式會印出警告並依 `signal_mix` 的交錯順序
+回推種類。該回推只對交錯排程產生的資料有效。
 
 ## 注意事項
 
-- **ROS package 名稱為 `speed_control`，但目前做的是力矩控制。** 這是早期速度控制
-  版本留下的名稱。改名會影響 `colcon build` 產物名稱與 `ros2 run` 的呼叫方式，
-  因此暫時保留。
-- **資料收集已可重現。** 訊號產生器會在啟動時以 `config.seed` 設定 NumPy 與
+- **ROS package 名稱為 `speed_control`，控制方式為力矩。** `colcon build` 的產物名稱
+  與 `ros2 run` 的呼叫方式都以這個名稱為準。
+- **資料收集可重現。** 訊號產生器會在啟動時以 `config.seed` 設定 NumPy 與
   Python 的隨機種子。
 - **訓練預設不保證位元級可重現。** GPU 上 cuDNN 的演算法選擇與浮點累加順序會有
   差異。需要嚴格重現時把 config 的 `deterministic` 設為 `True`。
+- **模擬器若發散（`/joint_states` 出現 NaN），收集會立刻停止並捨棄該輪資料。**
+  存檔時也會單獨報告非有限值的列數，因為與 NaN 比較永遠為假，超限統計看不出來。
 - **`data/`、`models/`、`runs/`、`plots/`、`scalers/` 都在 .gitignore 內**，
   不會進版控。跨機器搬移時需另外複製，且 `scalers/*.json` 與 `models/*.pth`
   必須成對使用，混用會讓預測完全錯誤。
 - **`scipy.interpolate.interp1d` 在新版 SciPy 中標記為 legacy**，目前仍可使用。
-  未來若被移除，線性內插可換成 `numpy.interp`，三次樣條可換成
-  `scipy.interpolate.CubicSpline`。使用處為 `data_collection.py` 的狀態對齊與
+  未來若被移除，三次樣條可換成 `scipy.interpolate.CubicSpline`。使用處為
   `signals.py` 的 SMOOTH_NOISE 產生器。

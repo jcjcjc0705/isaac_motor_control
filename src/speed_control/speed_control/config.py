@@ -1,13 +1,13 @@
 """Central configuration for the motor dynamics identification pipeline.
 
-Every tunable parameter lives here, including training, visualisation and data
-inspection settings. None of the scripts take command-line flags: edit this file
-and re-run. The ROS data-collection side and the PyTorch training side both
-import this module, so they can never disagree about episode layout, feature
-width or safety limits.
+Every tunable parameter lives here: data collection, model, training,
+visualisation and data inspection. No script takes command-line flags, so the
+way to change a setting is to edit this file and re-run. Both the ROS
+collection side and the PyTorch training side import this module, which is what
+keeps their episode layout, feature width and safety limits in agreement.
 
-The dataclass is frozen. Derive variants with ``dataclasses.replace`` instead of
-mutating the shared instance.
+The dataclass is frozen. Build a variant with ``dataclasses.replace`` rather
+than mutating ``DEFAULT_CONFIG``.
 """
 
 import os
@@ -33,8 +33,9 @@ class ExperimentConfig:
     episode_len: int = 200      # excitation steps per episode
     reset_len: int = 100        # settling steps that drive the motor back to zero
     total_episodes: int = 500
-    dt: float = 0.05            # control period in seconds, 20 Hz
-    progress_every: int = 100   # command steps between collection progress lines
+    dt: float = 0.05            # period of one recorded row, 20 Hz
+    record_decimation: int = 3  # /joint_states messages per recorded row
+    progress_every: int = 100   # recorded steps between collection progress lines
 
     # ------------------------------------------------------------------
     # CSV schema
@@ -67,7 +68,9 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Excitation signals
     # ------------------------------------------------------------------
-    amplitude: float = 200.0
+    # Amplitude is not a setting: the amplitude property below derives it from
+    # effort_to_pos_gain. signal_mix is the share of episodes each signal type
+    # gets, and the shares are normalised by episode count, not by weight.
     signal_mix: Tuple[Tuple[str, float], ...] = (
         ("RAMPS", 0.2),
         ("PRBS", 0.2),
@@ -94,30 +97,51 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Safety limits, radians
     # ------------------------------------------------------------------
-    hard_limit: float = 1.57         # 90 deg, the real mechanical limit
-    abort_limit: float = 1.4         # 80 deg, hand over to the recovery controller
-    planner_safe_limit: float = 1.2  # 69 deg, virtual wall used when shaping signals
-    effort_to_pos_gain: float = 0.01 # rough effort -> position gain of the plant
-    max_slew_rate: float = 500.0     # effort units per step
+    hard_limit: float = 1.57         # 90 deg, the mechanical travel limit
+    abort_limit: float = 1.4         # 80 deg, hands the motor to the recovery controller
+    planner_safe_limit: float = 1.2  # 69 deg, the angle signals are shaped to fit
+    planner_margin: float = 0.05     # headroom kept below planner_safe_limit
+    # Radians of excursion per unit of held effort, measured by collector mode
+    # 3. It describes the mechanism -- links, masses, friction -- so it has to
+    # be re-measured whenever any of those change, and it is what modes 1 and 2
+    # prompt for at startup. The value here is the default the prompt offers on
+    # Enter.
+    #
+    # Use the peak gain mode 3 reports rather than the equilibrium gain: the
+    # signal generators ask how far a waveform throws a joint, which includes
+    # the overshoot on the way to the equilibrium angle.
+    effort_to_pos_gain: float = 1.15
+    max_slew_rate: float = 500.0     # largest step-to-step change in the command
     lookahead: float = 0.2           # seconds of forward prediction before aborting
 
     # ------------------------------------------------------------------
-    # Recovery / reset PD controller
+    # Recovery controller, used during the reset phase and after an abort
     # ------------------------------------------------------------------
-    reset_kp: float = 100.0
-    reset_kd: float = 10.0
-    max_effort: float = 200.0
-    settled_pos_tol: float = 0.02
-    settled_vel_tol: float = 0.05
+    # Both gains at zero means the recovery publishes no effort and lets the
+    # joints coast to a stop on their own friction, which is what a rig with dry
+    # friction does. Non-zero gains turn the reset into a PD loop closed through
+    # the round trip to the simulator, so raise them only if the mechanism will
+    # not settle on its own, and expect to re-tune them per mechanism.
+    reset_kp: float = 0.0
+    reset_kd: float = 0.0
+    max_effort: float = 2.5         # ceiling on any effort the nodes publish
+    settled_pos_tol: float = 0.02   # radians from zero that counts as settled
+    settled_vel_tol: float = 0.05   # rad/s that counts as stopped
+    settle_timeout: float = 20.0    # seconds of simulator time before giving up
 
     # ------------------------------------------------------------------
     # Gain calibration (collector mode 3)
     # ------------------------------------------------------------------
-    calib_effort: float = 200.0
-    calib_start_duration: float = 0.15  # seconds of the first effort pulse
-    calib_duration_step: float = 0.05   # pulse lengthening per round
-    calib_reset_duration: float = 5.0
-    calib_limit: float = 3.0            # abort angle for motor and joints
+    # Mode 3 holds a constant effort until the joints stop moving, reads the
+    # angle gravity balances it at, then repeats one step higher until a joint
+    # reaches calib_limit. The slope of angle against effort is the gain it
+    # reports.
+    calib_start_effort: float = 0.25    # first effort held
+    calib_effort_step: float = 0.25     # added each round
+    calib_effort: float = 2.0           # highest effort to try
+    calib_hold_duration: float = 8.0    # seconds allowed to reach equilibrium
+    calib_reset_duration: float = 8.0   # seconds allowed to return to rest
+    calib_limit: float = 1.2            # abort angle for motor and joints
 
     # ------------------------------------------------------------------
     # Visualisation (visualize_model.py)
@@ -126,7 +150,7 @@ class ExperimentConfig:
     viz_include_test: bool = True
     viz_test_start: int = 8800          # first row sliced out of the test CSV
     viz_test_len: Optional[int] = 1100  # None means "to the end of the file"
-    viz_channels: Tuple[int, ...] = (0, 1, 2, 3)  # target_cols indices: all four channels
+    viz_channels: Tuple[int, ...] = (0, 1, 2, 3)  # which target_cols to plot
 
     # ------------------------------------------------------------------
     # Data inspection (plot_data.py)
@@ -141,6 +165,18 @@ class ExperimentConfig:
     def seq_len(self) -> int:
         """Rows per episode in the CSV: excitation phase plus reset phase."""
         return self.episode_len + self.reset_len
+
+    @property
+    def amplitude(self) -> float:
+        """Largest |effort| an episode may ask for, in effort units.
+
+        This is the effort whose predicted excursion exactly fills the safe
+        band, so the schedule randomises amplitudes underneath it and the
+        planner has nothing left to trim. It follows effort_to_pos_gain, which
+        is why entering a freshly measured gain is enough to fit a collection
+        to a new mechanism.
+        """
+        return (self.planner_safe_limit - self.planner_margin) / self.effort_to_pos_gain
 
     @property
     def input_dim(self) -> int:

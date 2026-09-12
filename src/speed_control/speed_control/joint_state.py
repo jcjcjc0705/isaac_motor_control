@@ -1,6 +1,21 @@
-"""Shared /joint_states parsing for the ROS nodes."""
+"""Shared /joint_states parsing and /joint_command building for the ROS nodes."""
+
+import math
 
 from sensor_msgs.msg import JointState
+
+def wrap_to_pi(angle: float) -> float:
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def build_command(stamp, effort: float) -> JointState:
+    """Effort command for the motor, as published on /joint_command."""
+    msg = JointState()
+    msg.header.stamp = stamp
+    msg.name = ["motor"]
+    msg.effort = [float(effort)]
+    return msg
+
 
 MOTOR_NAMES = {"motor"}
 JOINT1_NAMES = {"joint", "joint1"}
@@ -10,9 +25,9 @@ JOINT2_NAMES = {"joint2"}
 class JointStateTracker:
     """Latest pose of the motor and the links it drives.
 
-    The USD scenes differ in how many links they define, so ``has_joint2``
-    records whether the second link was ever reported rather than being
-    configured up front.
+    Positions are wrapped to +/-pi as they arrive, so every consumer sees the
+    same angle. ``has_joint2`` reports whether the scene published a second
+    link, which is detected from the messages rather than configured.
     """
 
     def __init__(self):
@@ -30,19 +45,23 @@ class JointStateTracker:
         for index, raw_name in enumerate(msg.name):
             name = raw_name.lower()
             if name in MOTOR_NAMES:
-                self.motor_pos = msg.position[index]
+                self.motor_pos = wrap_to_pi(msg.position[index])
                 self.motor_vel = msg.velocity[index]
             elif name in JOINT1_NAMES:
-                self.joint1_pos = msg.position[index]
+                self.joint1_pos = wrap_to_pi(msg.position[index])
                 self.joint1_vel = msg.velocity[index]
             elif name in JOINT2_NAMES:
-                self.joint2_pos = msg.position[index]
+                self.joint2_pos = wrap_to_pi(msg.position[index])
                 self.joint2_vel = msg.velocity[index]
                 self.has_joint2 = True
             else:
                 continue
             matched = True
         return matched
+
+    def is_finite(self) -> bool:
+        """False once the simulator has diverged and is publishing NaN."""
+        return all(math.isfinite(v) for v in self.as_row())
 
     def max_abs_position(self) -> float:
         positions = [abs(self.motor_pos), abs(self.joint1_pos)]

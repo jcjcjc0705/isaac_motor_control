@@ -1,8 +1,7 @@
 """Command feature construction and input/output scaling.
 
-Training and inference must build features identically. A mismatch here keeps
-the tensor shapes valid, so nothing raises: the only symptom is a silently worse
-R2. Both paths therefore go through ``build_features`` and ``Scaler``.
+Training and inference both build their inputs with :func:`build_features` and
+scale them with :class:`Scaler`, which is what keeps the two consistent.
 """
 
 import json

@@ -1,7 +1,8 @@
 """Neural state-space model of the motor and its driven link.
 
-Defined once and imported by both training and inference. Keeping a second copy
-anywhere will eventually let the two drift apart.
+Built through :func:`build_model` by training and inference alike, so the two
+always instantiate the same architecture. :func:`load_model` adds the
+checkpoint named by the config.
 """
 
 import torch
@@ -18,9 +19,8 @@ class NSSM(nn.Module):
         x_{t+1} = (1 - a) x_t + a f(x_t, u_t)
 
     The state update is a residual (forward Euler) step whose leak rate ``a`` is
-    learned through a sigmoid. Initialising it small keeps the state nearly
-    constant at the start of training, which is what makes backpropagation
-    through several hundred steps stable.
+    learned through a sigmoid, initialised small so the state starts out nearly
+    constant and backpropagation through several hundred steps stays stable.
     """
 
     def __init__(self, state_dim: int, input_dim: int, output_dim: int):
@@ -69,9 +69,9 @@ class NSSM(nn.Module):
 class CascadedSystem(nn.Module):
     """Two NSSM stages: motor first, then the link it drives.
 
-    The joint stage sees the motor stage's prediction as an extra input, but
-    that tensor is detached, so joint-side error never back-propagates into the
-    motor model. The two stages therefore train independently.
+    The joint stage takes the motor stage's prediction as an extra input,
+    detached, so joint-side error does not back-propagate into the motor model
+    and the two stages train independently.
 
     Output channel order matches ``cfg.target_cols``: the first two channels
     come from the motor stage, the last two from the joint stage.
@@ -104,7 +104,7 @@ class CascadedSystem(nn.Module):
 
 
 def build_model(cfg: ExperimentConfig) -> CascadedSystem:
-    """The single entry point used by training and inference alike."""
+    """Construct the model described by the config."""
     return CascadedSystem(cfg.state_dim, cfg.input_dim, cfg.history_window, cfg.output_dim)
 
 

@@ -1,112 +1,200 @@
-"""Estimate the plant's effort-to-position gain by probing its travel limit.
+"""Measure the plant's effort-to-position gain from its equilibrium angles.
 
-Drives the motor with a fixed effort pulse whose duration grows each round,
-returning to zero in between, until some joint passes ``cfg.calib_limit``. The
-gain is then back-computed from the last pulse that did not hit the wall.
+A held effort settles at the angle where gravity balances it, so the gain is
+the slope of angle against effort. This node holds an effort until the joints
+stop, reads the angle, and repeats one step higher until a joint reaches
+``cfg.calib_limit``. Both joints are measured and the larger angle wins, since
+on a linkage the driven joint is not necessarily the one that swings furthest.
 
-Feed the printed value into ``effort_to_pos_gain`` in config.py so the signal
-generators can shape waveforms that stay inside the safe band.
+Two gains come out of it: the equilibrium gain, and the peak gain that includes
+the overshoot on the way to equilibrium. ``effort_to_pos_gain`` wants the peak
+one, which is what the report prints.
+
+Usage: collector mode 3, ``ros2 run speed_control data_collector``. Run it
+after any change to the mechanism and type its answer at the mode 1 or 2
+prompt, because the excitation amplitude is derived from the gain. Settings
+come from the calib_* block in config.py.
 """
+
+import math
 
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
 from .config import DEFAULT_CONFIG
-from .joint_state import JointStateTracker
+from .joint_state import JointStateTracker, build_command
 from .node_runner import run_node
 
 
 class GainCalibrationNode(Node):
+    """Step the effort up, holding each level until the joints stop moving."""
+
     def __init__(self, cfg=DEFAULT_CONFIG):
         super().__init__("gain_calibration")
         self.cfg = cfg
         self.tracker = JointStateTracker()
 
-        self.create_subscription(JointState, "/joint_states", self.on_joint_states, 10)
+        self.create_subscription(JointState, "/joint_states", self.on_joint_states, 50)
         self.publisher = self.create_publisher(JointState, "/joint_command", 10)
-        self.create_timer(cfg.dt, self.on_timer)
 
-        self.phase = "DRIVE_POSITIVE"
-        self.pulse_duration = cfg.calib_start_duration
-        self.phase_elapsed = 0.0
-        self.estimated_gain = 5.0
+        self.effort = cfg.calib_start_effort
+        self.samples = []           # (effort, equilibrium angle, peak angle)
+        self.phase = "RECOVER"
+        self.phase_t0 = None
+        self.peak = 0.0
 
-        self.get_logger().info(
-            f"Gain calibration started, abort limit {cfg.calib_limit} rad"
-        )
+        print("")
+        print(f"Gain calibration: holding {cfg.calib_start_effort} to "
+              f"{cfg.calib_effort} in steps of {cfg.calib_effort_step}, "
+              f"abort at {cfg.calib_limit} rad")
+        print("All other settings come from config.py")
+        print("")
 
     def send_effort(self, effort: float) -> None:
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ["motor"]
-        msg.effort = [float(effort)]
-        self.publisher.publish(msg)
+        self.publisher.publish(
+            build_command(self.get_clock().now().to_msg(), effort)
+        )
+
+    def at_rest(self) -> bool:
+        """Moving slowly enough to call the current angle an equilibrium.
+
+        Velocity only, since a held effort settles away from zero and
+        :func:`is_settled` tests for a pose near zero.
+        """
+        return (abs(self.tracker.motor_vel) < self.cfg.settled_vel_tol
+                and abs(self.tracker.joint1_vel) < self.cfg.settled_vel_tol)
 
     def on_joint_states(self, msg: JointState) -> None:
-        if self.tracker.update(msg):
-            print(f"[state] {self.tracker.summary()}", end="\r")
+        """One step per message, so the node runs on the simulator's clock."""
+        if not self.tracker.update(msg):
+            return
+        if not self.tracker.is_finite():
+            print("\nError: /joint_states went non-finite, the simulator has "
+                  "diverged. Stop and Play in Isaac Sim, then re-run.")
+            self.send_effort(0.0)
+            raise SystemExit
 
-    def report_and_stop(self) -> None:
-        """Back-compute the gain from the last pulse that stayed inside the limit."""
-        safe_duration = max(self.pulse_duration - self.cfg.dt, self.cfg.dt)
-        ideal_distance = 0.5 * self.cfg.calib_effort * (safe_duration ** 2)
-        self.estimated_gain = self.cfg.calib_limit / ideal_distance
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self.phase_t0 is None:
+            self.phase_t0 = stamp
+        elapsed = stamp - self.phase_t0
+        angle = self.tracker.max_abs_position()
 
-        print("")
-        print("Gain calibration result")
-        print(f"  Last safe pulse    : {safe_duration:.2f} s")
-        print(f"  effort_to_pos_gain : {self.estimated_gain:.3f}")
-        print("  Copy this value into config.py")
-        print("")
-
-        self.send_effort(0.0)
-        raise SystemExit
-
-    def on_timer(self) -> None:
-        if self.tracker.exceeds(self.cfg.calib_limit):
+        if angle > self.cfg.calib_limit:
+            print(f"\n{self.effort:.3f} reached {angle:.3f} rad, past the "
+                  f"{self.cfg.calib_limit} rad abort angle")
             self.report_and_stop()
             return
 
-        if self.phase == "DRIVE_POSITIVE":
-            if self.phase_elapsed < self.pulse_duration:
-                self.send_effort(self.cfg.calib_effort)
-                self.phase_elapsed += self.cfg.dt
-            else:
-                self.phase = "DRIVE_NEGATIVE"
-                self.phase_elapsed = 0.0
+        if self.phase == "RECOVER":
+            self.send_effort(0.0)
+            if elapsed > self.cfg.calib_reset_duration or (
+                    elapsed > 1.0 and is_settled(self.tracker, self.cfg)):
+                self.phase, self.phase_t0, self.peak = "HOLD", stamp, 0.0
+            return
 
-        elif self.phase == "DRIVE_NEGATIVE":
-            if self.phase_elapsed < self.pulse_duration:
-                self.send_effort(-self.cfg.calib_effort)
-                self.phase_elapsed += self.cfg.dt
-            else:
-                self.phase = "RECOVER"
-                self.phase_elapsed = 0.0
-                self.send_effort(0.0)
-                print(f"\nPassed {self.pulse_duration:.2f} s "
-                      f"(max {self.tracker.max_abs_position():.2f} rad), recovering")
+        self.send_effort(self.effort)
+        self.peak = max(self.peak, angle)
+        print(f"[hold {self.effort:6.3f}] {self.tracker.summary()}", end="\r")
+        settled = elapsed > 1.0 and self.at_rest()
+        if not settled and elapsed < self.cfg.calib_hold_duration:
+            return
 
-        elif self.phase == "RECOVER":
-            self.send_effort(recovery_effort(self.tracker, self.cfg))
-            if self.phase_elapsed < self.cfg.calib_reset_duration:
-                self.phase_elapsed += self.cfg.dt
-                if is_settled(self.tracker, self.cfg) and self.phase_elapsed > 0.5:
-                    self.phase_elapsed = self.cfg.calib_reset_duration
-            else:
-                self.phase = "DRIVE_POSITIVE"
-                self.phase_elapsed = 0.0
-                self.pulse_duration += self.cfg.calib_duration_step
+        if settled:
+            self.samples.append((self.effort, angle, self.peak))
+            print(f"\n  effort {self.effort:6.3f}  ->  equilibrium "
+                  f"{angle:.4f} rad, peak {self.peak:.4f} rad")
+        else:
+            print(f"\n  effort {self.effort:6.3f}  ->  still moving after "
+                  f"{self.cfg.calib_hold_duration:.0f}s, not recorded")
+
+        self.effort += self.cfg.calib_effort_step
+        self.phase, self.phase_t0 = "RECOVER", stamp
+        if self.effort > self.cfg.calib_effort + 1e-9:
+            self.report_and_stop()
+
+    def report_and_stop(self) -> None:
+        """Fit angle against effort and print the slope."""
+        self.send_effort(0.0)
+        print("")
+        print("Gain calibration result")
+        if len(self.samples) < 2:
+            print(f"  Only {len(self.samples)} usable level(s): nothing to fit.")
+            print("  Lower calib_start_effort, or raise calib_limit if the rig "
+                  "has more travel than the abort angle allows.")
+            print("")
+            raise SystemExit
+
+        efforts = [s[0] for s in self.samples]
+        equilibria = [s[1] for s in self.samples]
+        peaks = [s[2] for s in self.samples]
+        equilibrium_gain = _slope(efforts, equilibria)
+        peak_gain = _slope(efforts, peaks)
+
+        print(f"  Levels held        : {len(self.samples)} "
+              f"({efforts[0]:.3f} to {efforts[-1]:.3f})")
+        print(f"  Equilibrium gain   : {equilibrium_gain:.3f} rad per unit effort")
+        print(f"  Peak gain          : {peak_gain:.3f} rad per unit effort")
+        print(f"  Overshoot          : {peak_gain / equilibrium_gain:.2f}x"
+              if equilibrium_gain > 1e-9 else "  Overshoot          : n/a")
+        print("")
+        print(f"  effort_to_pos_gain : {peak_gain:.3f}")
+        print("  Type this at the effort_to_pos_gain prompt in collector mode 1 "
+              "or 2.")
+        print("  It is the peak gain, not the equilibrium one, because that is "
+              "what the")
+        print("  signal generators need: they ask how far a waveform throws a "
+              "joint, not")
+        print("  where it would come to rest.")
+        print("")
+
+        amplitude = (self.cfg.planner_safe_limit - self.cfg.planner_margin) / peak_gain
+        print(f"  With it, excitation runs at |effort| <= {amplitude:.3f} and is "
+              f"predicted to")
+        print(f"  reach {math.degrees(amplitude * peak_gain):.1f} deg, inside the "
+              f"{math.degrees(self.cfg.hard_limit):.0f} deg travel. Put it in "
+              f"config.py as")
+        print("  the new default once the mechanism is settled.")
+        print("")
+        raise SystemExit
+
+
+def _slope(x, y) -> float:
+    """Least-squares slope through the origin, which the plant passes through."""
+    denominator = sum(v * v for v in x)
+    if denominator < 1e-12:
+        return 0.0
+    return sum(a * b for a, b in zip(x, y)) / denominator
+
+
+def clamp(value: float, limit: float) -> float:
+    """Clamp to +/-limit, mapping a non-finite value to zero.
+
+    ``min``/``max`` return the bound when handed a NaN, which would mean
+    answering a diverged simulator with a command at full effort.
+    """
+    if not math.isfinite(value):
+        return 0.0
+    return max(-limit, min(limit, value))
 
 
 def recovery_effort(tracker: JointStateTracker, cfg) -> float:
     """PD effort that drives the motor back to zero, clamped to max_effort."""
     effort = -cfg.reset_kp * tracker.motor_pos - cfg.reset_kd * tracker.motor_vel
-    return max(-cfg.max_effort, min(cfg.max_effort, effort))
+    return clamp(effort, cfg.max_effort)
 
 
 def is_settled(tracker: JointStateTracker, cfg) -> bool:
+    """Both joints near zero and stopped.
+
+    joint1 counts as well as the motor, because training rolls every episode
+    out from a zero initial state and an episode that starts with the link
+    still swinging does not match that assumption.
+    """
     return (abs(tracker.motor_pos) < cfg.settled_pos_tol
-            and abs(tracker.motor_vel) < cfg.settled_vel_tol)
+            and abs(tracker.motor_vel) < cfg.settled_vel_tol
+            and abs(tracker.joint1_pos) < cfg.settled_pos_tol
+            and abs(tracker.joint1_vel) < cfg.settled_vel_tol)
 
 
 def main(args=None) -> None:

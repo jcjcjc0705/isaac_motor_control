@@ -1,7 +1,15 @@
 """Inspect a collected dataset: limit violations and per-episode waveforms.
 
-All settings come from src/speed_control/speed_control/config.py. Edit that file
-and re-run; this script takes no command-line arguments.
+Prints a limit report for ``cfg.inspect_file`` and writes a three-panel figure
+next to it: velocity and position for ``cfg.inspect_episode_id``, plus an
+overview of the whole session with the over-limit episodes shaded.
+
+Usage:
+
+    python plot_data.py
+
+All settings come from src/speed_control/speed_control/config.py. Edit that
+file and re-run; this script takes no command-line arguments.
 """
 
 import glob
@@ -72,7 +80,7 @@ def plot_dataset(df: pd.DataFrame, config, failed_episodes, has_joint2, csv_path
 
     _, (ax_velocity, ax_position, ax_overview) = plt.subplots(3, 1, figsize=(14, 15))
 
-    # matplotlib cannot index a pandas Series directly; hand it plain arrays.
+    # Plain arrays, since matplotlib cannot index a pandas Series directly.
     episode_time = episode[time_col].to_numpy()
     session_time = df[time_col].to_numpy()
 

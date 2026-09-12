@@ -1,7 +1,15 @@
 """Plot open-loop predictions of a trained model against recorded data.
 
-All settings come from src/speed_control/speed_control/config.py. Edit that file
-and re-run; this script takes no command-line arguments.
+Rolls the checkpoint out over the episodes in ``cfg.viz_train_episodes`` and
+over a slice of the test file, and writes one figure per episode to
+``cfg.plot_dir`` with R2 and MSE per channel in the panel titles.
+
+Usage:
+
+    python visualize_model.py
+
+All settings come from src/speed_control/speed_control/config.py. Edit that
+file and re-run; this script takes no command-line arguments.
 """
 
 import os

@@ -16,10 +16,10 @@ SIGNAL_TYPE_COL = "signal_type"
 class EpisodeDataset(Dataset):
     """One sample per episode: a full command sequence and its response.
 
-    Episodes whose length differs from ``cfg.seq_len`` are dropped, because the
+    Episodes whose length differs from ``cfg.seq_len`` are dropped, since the
     model is rolled out over a fixed horizon. ``episode_ids`` records which
-    source episode each sample came from, so a split can be built from the CSV's
-    own metadata rather than from positional arithmetic.
+    source episode each sample came from, which is what lets a split be built
+    from the CSV's own metadata rather than from positional arithmetic.
     """
 
     def __init__(
@@ -73,10 +73,9 @@ def episode_signal_types(
 ) -> Dict[int, str]:
     """Map each sample index to the signal type that excited it.
 
-    Prefers the ``signal_type`` column written by the collector. Older CSVs
-    lack it, so the order implied by ``cfg.signal_mix`` is reconstructed
-    instead. That reconstruction is only valid for data produced by the
-    interleaved schedule.
+    Read from the ``signal_type`` column the collector writes. A CSV without
+    that column falls back to the order implied by ``cfg.signal_mix``, which
+    holds only for data recorded by the interleaved schedule.
     """
     if SIGNAL_TYPE_COL in df.columns:
         by_episode = df.groupby("episode_id")[SIGNAL_TYPE_COL].first().to_dict()
@@ -96,8 +95,7 @@ def stratified_split(
     """Split sample indices so every signal type is represented in validation.
 
     Each signal type is bucketed separately and sampled at a fixed stride, so
-    changing ``cfg.val_ratio`` cannot accidentally correlate the stride with the
-    episode ordering and collapse validation onto a single signal type.
+    validation covers every type whatever ``cfg.val_ratio`` is set to.
     """
     buckets: Dict[str, List[int]] = {}
     for index, signal_type in types.items():

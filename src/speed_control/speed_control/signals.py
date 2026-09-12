@@ -1,11 +1,11 @@
 """Excitation signal generation and episode scheduling.
 
-Pure NumPy, no ROS dependency, so waveforms can be generated and plotted
+Pure NumPy with no ROS dependency, so waveforms can be generated and plotted
 without launching the simulator.
 
 Every generator shapes its output so the plant is predicted to stay inside
-``cfg.planner_safe_limit``. That prediction uses a crude first-order plant
-model, so the collector still enforces a real-time abort on top of it.
+``cfg.planner_safe_limit``. The prediction is a crude one, and the collector
+enforces a real-time abort on top of it.
 """
 
 import math
@@ -38,28 +38,24 @@ def seed_everything(seed: int) -> None:
 # Safety shaping
 # ----------------------------------------------------------------------
 
-def predict_drift(u: np.ndarray, dt: float, gain: float) -> np.ndarray:
-    """Predict joint position under a command sequence.
+def predict_peak(u: np.ndarray, gain: float) -> float:
+    """Predict the largest joint excursion a command sequence will produce.
 
-    A damped first-order model: velocity decays with viscous friction, position
-    decays as if gravity pulled it back to zero. Only accurate enough to decide
-    whether a waveform is obviously too aggressive.
+    A held effort settles at the angle where gravity balances it, so the
+    excursion follows the command's peak rather than its integral and the
+    prediction is a single multiplication by ``gain``, the radians per unit of
+    effort held in ``cfg.effort_to_pos_gain``.
+
+    The gain belongs to whichever joint swings furthest, which on a linkage is
+    not necessarily the driven one.
     """
-    velocity_decay = 0.90
-    position_decay = 0.98
-
-    pos = np.zeros(len(u))
-    vel = np.zeros(len(u))
-    for i in range(1, len(u)):
-        vel[i] = vel[i - 1] * velocity_decay + u[i - 1] * dt * gain
-        pos[i] = pos[i - 1] * position_decay + vel[i] * dt
-    return pos
+    return gain * float(np.max(np.abs(u)))
 
 
-def scale_to_safe_drift(u: np.ndarray, cfg: ExperimentConfig) -> np.ndarray:
-    """Uniformly shrink a waveform until its predicted drift fits the safe band."""
-    limit = cfg.planner_safe_limit - 0.05
-    peak = np.max(np.abs(predict_drift(u, cfg.dt, cfg.effort_to_pos_gain)))
+def scale_to_safe_peak(u: np.ndarray, cfg: ExperimentConfig) -> np.ndarray:
+    """Uniformly shrink a waveform until its predicted peak fits the safe band."""
+    limit = cfg.planner_safe_limit - cfg.planner_margin
+    peak = predict_peak(u, cfg.effort_to_pos_gain)
     if peak > limit:
         u = u * (limit / peak)
     return u
@@ -82,31 +78,22 @@ def limit_slew_rate(signal: np.ndarray, max_step: float) -> np.ndarray:
 def _make_prbs(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
     """Alternating-sign square pulses with randomised hold times.
 
-    Hold time is capped by how long the predicted position can travel before
-    reaching the safe limit, so this generator needs no post-hoc scaling.
+    ``plan.param_range`` is the hold time in steps. Hold time does not bound
+    the excursion -- a joint stops at the angle that balances the torque and
+    stays there -- so the level is what the peak scaling shapes.
     """
     u = np.zeros(length)
-    limit = cfg.planner_safe_limit - 0.05
     min_hold, max_hold = int(plan.param_range[0]), int(plan.param_range[1])
 
     index = 0
-    predicted_pos = 0.0
     sign = plan.sign
     while index < length:
         level = sign * np.random.uniform(0.3 * plan.amplitude, plan.amplitude)
-        headroom = (limit - predicted_pos) if level > 0 else (predicted_pos + limit)
-
-        max_safe_hold = max(1, int(headroom / (abs(level) * cfg.effort_to_pos_gain * cfg.dt)))
-        upper = min(max_hold, max_safe_hold)
-        lower = min(min_hold, upper)
-
-        end = min(index + np.random.randint(lower, upper + 1), length)
+        end = min(index + np.random.randint(min_hold, max_hold + 1), length)
         u[index:end] = level
-
-        predicted_pos += level * (end - index) * cfg.dt * cfg.effort_to_pos_gain
         sign *= -1
         index = end
-    return u
+    return scale_to_safe_peak(u, cfg)
 
 
 def _make_ramps(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
@@ -128,7 +115,7 @@ def _make_ramps(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.nda
         last_value = target
         sign *= -1
         index = end
-    return scale_to_safe_drift(u, cfg)
+    return scale_to_safe_peak(u, cfg)
 
 
 def _make_chirp(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
@@ -136,14 +123,14 @@ def _make_chirp(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.nda
     t = np.arange(length) * cfg.dt
     low, high = plan.param_range
     u = plan.sign * plan.amplitude * chirp(t, f0=low, t1=t[-1], f1=high, method="linear")
-    return scale_to_safe_drift(u, cfg)
+    return scale_to_safe_peak(u, cfg)
 
 
 def _make_multisine(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
     """Sum of three randomised tones, one per fixed frequency band.
 
-    The bands are intentionally independent of ``plan.param_range``: this
-    generator covers the whole spectrum in every episode.
+    The bands are independent of ``plan.param_range``, so every episode of this
+    type covers the whole spectrum.
     """
     bands = [(0.5, 1.5), (1.5, 3.0), (3.0, 6.0)]
     t = np.arange(length) * cfg.dt
@@ -158,7 +145,7 @@ def _make_multisine(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np
 
     if normaliser > 0:
         u = (u / normaliser) * plan.amplitude
-    return scale_to_safe_drift(u, cfg)
+    return scale_to_safe_peak(u, cfg)
 
 
 def _make_smooth_noise(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
@@ -173,7 +160,7 @@ def _make_smooth_noise(cfg: ExperimentConfig, plan: EpisodePlan, length: int) ->
 
     spline = interp1d(x_key, magnitudes * signs, kind="cubic", fill_value="extrapolate")
     u = np.clip(spline(np.arange(length)), -plan.amplitude, plan.amplitude)
-    return scale_to_safe_drift(u, cfg)
+    return scale_to_safe_peak(u, cfg)
 
 
 GENERATORS = {
@@ -202,7 +189,7 @@ def render_signal(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.n
 def frequency_split_levels(num_episodes: int) -> List[int]:
     """Powers of two up to sqrt(num_episodes), coarsest first.
 
-    Controls how finely a signal type's parameter range is subdivided, so the
+    Sets how finely a signal type's parameter range is subdivided, so the
     schedule sweeps from wide ranges down to narrow ones.
     """
     if num_episodes < 2:
@@ -261,8 +248,8 @@ def split_episode_counts(
 def build_training_schedule(cfg: ExperimentConfig) -> List[EpisodePlan]:
     """Interleave the per-type schedules into the episode order to be recorded.
 
-    Interleaving keeps every signal type spread across the whole session, so a
-    hardware drift partway through does not land entirely on one type.
+    Interleaving spreads every signal type across the whole session, so a drift
+    part-way through does not land entirely on one type.
     """
     counts = split_episode_counts(cfg.total_episodes, cfg.signal_mix)
     per_type = {

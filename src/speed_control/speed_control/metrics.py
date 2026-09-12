@@ -1,7 +1,5 @@
-"""Shared evaluation metrics.
-
-Training and visualisation used to compute R2 differently, which made their
-numbers incomparable. Both now call :func:`r2_score`.
+"""Evaluation metrics shared by training and visualisation, so the scores the
+two report are directly comparable.
 """
 
 import torch
