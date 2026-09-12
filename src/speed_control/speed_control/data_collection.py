@@ -29,6 +29,7 @@ import math
 import os
 from dataclasses import replace
 
+import numpy as np
 import pandas as pd
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -306,7 +307,45 @@ class DataCollectorNode(Node):
               f"{int(exceeded.sum())} ({exceeded.mean() * 100:.2f}%)")
         if len(failed):
             print(f"  Episodes affected        : {failed.tolist()}")
+        delay = command_delay(df, self.cfg.dt)
+        if delay == delay:
+            print(f"  Command delay            : {delay:.2f} steps "
+                  f"({delay * self.cfg.dt * 1000:.0f} ms), compare against the "
+                  f"other dataset's")
         print("")
+
+
+def command_delay(df: pd.DataFrame, dt: float) -> float:
+    """Recorded steps of delay between a command and the response to it.
+
+    The motor's acceleration is fitted to the command at the same step and at
+    the one before it; the share that lands on the earlier step is the delay.
+    It describes the session rather than the mechanism, because what sets it is
+    where the collector's publishing falls relative to the simulator's tick, so
+    it can differ between one run and the next.
+
+    Datasets meant to be used together -- a training set and the test set it is
+    scored against -- should report the same value. A model carries the delay
+    of the data it was fitted to, and reading it back on data with a different
+    one costs accuracy that looks like a worse model.
+    """
+    delays = []
+    for _, group in df.groupby("episode_id"):
+        u = group["input_u"].to_numpy(dtype=float)
+        v = group["vel_motor"].to_numpy(dtype=float)
+        if len(u) < 4 or not (np.isfinite(u).all() and np.isfinite(v).all()):
+            continue
+        if np.allclose(u, 0.0):
+            continue
+        acceleration = np.diff(v) / dt
+        design = np.column_stack(
+            [u[1:], u[:-1], v[1:], np.ones(len(acceleration))]
+        )
+        coefficients, *_ = np.linalg.lstsq(design, acceleration, rcond=None)
+        weight = abs(coefficients[0]) + abs(coefficients[1])
+        if weight > 1e-12:
+            delays.append(abs(coefficients[1]) / weight)
+    return float(np.median(delays)) if delays else float("nan")
 
 
 def prompt_mode() -> str:

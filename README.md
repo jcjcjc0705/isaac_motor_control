@@ -100,7 +100,7 @@ src/speed_control/speed_control/config.py
 | CSV 欄位 | `input_cols`, `target_cols` | `output_dim` 由 `target_cols` 長度自動推導 |
 | 模型 | `state_dim`, `history_window` | 狀態階數與堆疊的歷史命令步數 |
 | 訓練 | `batch_size`, `learning_rate`, `epochs`, `val_ratio`, `seed`, `deterministic` | `deterministic=True` 會開啟 cuDNN 決定性，較慢但可重現 |
-| 激勵訊號 | `signal_mix`, `signal_ranges` | 各訊號種類的配比與參數範圍；振幅不是設定值，由規劃器依預測擺幅推算 |
+| 激勵訊號 | `signal_mix`, `signal_ranges` | 各訊號種類的配比與參數範圍；振幅不是設定值，由規劃器依預測擺幅推算。MULTISINE 不看 `signal_ranges`，它從 `signals.py` 的 `MULTISINE_BANDS` 各抽一個音 |
 | 安全極限 | `hard_limit`, `abort_limit`, `planner_safe_limit`, `planner_lookahead_limit` | 見下方「安全機制」 |
 | 機構增益 | `effort_to_pos_gain`, `plant_time_constant` | 由模式 3 與資料量得，決定規劃器的預測 |
 | 歸零控制 | `reset_kp`, `reset_kd`, `max_effort` | 歸零段與中止後把馬達交給誰處理 |
@@ -209,6 +209,17 @@ effort_to_pos_gain [1.15]:
 這個值在排程建立時就要定案，所以只能在這裡問，不能等 node 起來之後再改。
 收集開始前 node 會先等機構完全靜止，因為訓練是以零初始狀態展開每個回合的。
 兩種模式都會直接覆寫目標檔案，不會產生時間戳檔名。
+
+**訓練集與測試集要在同一個 session 收完**，中途不要 Stop/Play。命令送出到響應出現
+之間有幾筆訊息的延遲，而這個延遲取決於收資料端的發布時機落在模擬器 tick 的哪一側，
+換一次 session 就可能差一筆訊息。模型會把訓練資料的延遲一起學進去，拿到延遲不同的
+測試集上評分，看起來會像模型變差。存檔時印出的這一行就是給你比對用的：
+
+```
+  Command delay            : 0.48 steps (24 ms), compare against the other dataset's
+```
+
+兩份資料的數值應該相近；差距到 0.3 步以上時，測試分數就已經被延遲汙染了。
 
 ### 6. 檢查資料品質（conda 終端機）
 
@@ -360,6 +371,13 @@ MULTISINE 是最容易低估的一種，因為低通模型沒有共振峰而它�
 歸零控制器的 `reset_kp` 與 `reset_kd` 預設為 0，也就是不施力、讓關節靠自身摩擦
 滑行到停止。若機構無法自行停下再調高它們，但那會把歸零段變成一個經由模擬器往返
 的 PD 迴路，且每換一次機構就要重新調。
+
+## 激勵的頻率覆蓋
+
+激勵的頻率覆蓋要涵蓋機構的模態，否則模型在沒被激發過的頻段上沒有約束。目前五種訊號
+合起來的命令功率分佈約為 0–0.5 Hz 32%、0.5–1 Hz 24%、1–2 Hz 29%、2–4 Hz 14%，
+涵蓋連桿的 0.7–0.9 Hz 與 1.9 Hz 兩個模態。換機構後值得用同樣的方式檢查一次：
+對每個回合的 `input_u` 取 FFT，看功率落在哪些頻帶。
 
 ## 驗證集切分
 

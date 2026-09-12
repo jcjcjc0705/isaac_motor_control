@@ -77,13 +77,14 @@ class ExperimentConfig:
         ("CHIRP", 0.2),
         ("MULTISINE", 0.4),
     )
-    # Per-type parameter range. Frequency in Hz, except PRBS which is hold steps.
+    # Per-type parameter range. Frequency in Hz, except PRBS which is hold
+    # steps. MULTISINE ignores this and draws from its own bands.
     signal_ranges: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         "RAMPS": (0.1, 1.5),
         "PRBS": (20, 60),
         "CHIRP": (0.1, 2.0),
         "MULTISINE": (0.1, 3.0),
-        "SMOOTH_NOISE": (0.1, 4.0),
+        "SMOOTH_NOISE": (0.1, 2.0),
     })
 
     # ------------------------------------------------------------------

@@ -175,21 +175,27 @@ def _make_chirp(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.nda
     return plan.sign * chirp(t, f0=low, t1=t[-1], f1=high, method="linear")
 
 
+# Hz, one tone drawn from each. They straddle the linkage's modes rather than
+# spreading evenly, and stop at 4 Hz, which the 20 Hz command rate still
+# resolves with five samples per cycle.
+MULTISINE_BANDS = ((0.2, 0.8), (0.8, 2.0), (2.0, 4.0))
+
+
 def _make_multisine(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
-    """Sum of three randomised tones, one per fixed frequency band.
+    """Sum of three randomised tones, one per band of MULTISINE_BANDS.
 
     The bands are independent of ``plan.param_range``, so every episode of this
     type covers the whole spectrum.
     """
-    bands = [(0.5, 1.5), (1.5, 3.0), (3.0, 6.0)]
     t = np.arange(length) * cfg.dt
 
     u = np.zeros(length)
     normaliser = 0.0
-    for low, high in bands:
+    for low, high in MULTISINE_BANDS:
         wave = np.sin if random.choice([True, False]) else np.cos
         weight = random.uniform(0.5, 1.5)
-        u += weight * wave(random.uniform(low, high) * t + random.uniform(0, 2 * np.pi))
+        frequency = random.uniform(low, high)
+        u += weight * wave(2.0 * np.pi * frequency * t + random.uniform(0, 2 * np.pi))
         normaliser += 1.5
 
     if normaliser > 0:
@@ -198,8 +204,15 @@ def _make_multisine(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np
 
 
 def _make_smooth_noise(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
-    """Cubic spline through alternating-sign random key points."""
-    spacing = max(1, int(0.5 / cfg.dt))
+    """Cubic spline through alternating-sign random key points.
+
+    ``plan.param_range`` is the key-point rate in Hz. Successive points
+    alternate in sign, so placing them half a period apart puts the waveform's
+    fundamental at the drawn frequency.
+    """
+    low, high = plan.param_range
+    frequency = np.random.uniform(low, high)
+    spacing = max(1, int((1.0 / (2.0 * frequency)) / cfg.dt))
     num_points = length // spacing + 2
 
     x_key = np.linspace(0, length, num_points)
