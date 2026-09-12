@@ -106,7 +106,7 @@ src/speed_control/speed_control/config.py
 | 歸零控制 | `reset_kp`, `reset_kd`, `max_effort` | 歸零段與中止後把馬達交給誰處理 |
 | 增益校正 | `calib_start_effort`, `calib_effort_step`, `calib_effort`, `calib_limit` | 模式 3 的施力範圍與中止角度 |
 | 可視化 | `viz_train_episodes`, `viz_test_start`, `viz_channels` | 要畫哪些回合、測試檔切片範圍、要畫哪些通道 |
-| 資料檢視 | `inspect_file`, `inspect_episode_id` | plot_data.py 的分析對象 |
+| 資料檢視 | `inspect_episode_id` | plot_data.py 每份檔案要畫哪個回合；畫的檔案是 `data_dir` 內全部的 CSV |
 
 ## 操作步驟
 
@@ -216,7 +216,9 @@ effort_to_pos_gain [1.15]:
 python3 plot_data.py
 ```
 
-輸出超限統計與 `data/<name>_analysis.png`（單回合速度、單回合位置、全場總覽）。
+把 `data/` 內每一份 CSV 都讀過一次，各自輸出超限統計與 `data/<檔名>_analysis.png`
+（單回合速度、單回合位置、全場總覽）。讀不動、沒有資料列、或缺少必要欄位的檔案會
+印出原因並跳過。
 
 ### 7. 訓練（conda 終端機）
 

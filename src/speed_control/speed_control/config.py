@@ -168,7 +168,8 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Data inspection (plot_data.py)
     # ------------------------------------------------------------------
-    inspect_file: str = "data/test.csv"
+    # plot_data.py reads every CSV under data_dir; this picks the episode whose
+    # waveforms the per-episode panels show, in each file.
     inspect_episode_id: int = 0
 
     # ------------------------------------------------------------------
