@@ -1,0 +1,15 @@
+# Training-side dependencies only: train.py, visualize_model.py, plot_data.py.
+#
+# The ROS side needs nothing from pip. Its dependencies (numpy, scipy, pandas)
+# ship as apt packages on Ubuntu, and rclpy / sensor_msgs come from the ROS 2
+# installation. Installing this file into the ROS interpreter is neither
+# required nor recommended; see the README section "兩個直譯器".
+#
+# Conda users can create the training environment from environment.yml instead.
+
+numpy
+scipy
+pandas
+matplotlib
+torch>=2.0
+tensorboard

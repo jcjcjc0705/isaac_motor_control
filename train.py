@@ -1,401 +1,167 @@
+"""Train the cascaded NSSM on collected motor data.
+
+All settings come from src/speed_control/speed_control/config.py. Edit that file
+and re-run; this script takes no command-line arguments.
+"""
+
 import os
+import subprocess
 import sys
 import time
-import json
-import subprocess
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, Subset
-from torch.optim.lr_scheduler import ExponentialLR
-from torch.utils.tensorboard import SummaryWriter
 
 import pandas as pd
-import numpy as np
-
-# 引入 Config
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src', 'speed_control'))
-from speed_control.config import DEFAULT_TRAIN_CONFIG
-
-# --- Configuration ---
-cfg = DEFAULT_TRAIN_CONFIG
-
-STATE_DIM = cfg.state_dim
-INPUT_DIM = cfg.input_dim
-OUTPUT_DIM = cfg.output_dim
-SEQ_LEN = cfg.seq_len
-BATCH_SIZE = cfg.batch_size
-LEARNING_RATE = cfg.learning_rate
-EPOCHS = cfg.epochs
-LR_DECAY_GAMMA = cfg.lr_decay_gamma
-HISTORY_WINDOW = cfg.history_window
-
-DATA_FILE = cfg.data_file
-MODEL_SAVE_PATH = cfg.model_save_path
-SCALER_SAVE_PATH = cfg.scaler_save_path
-MODEL_DIR = cfg.model_dir
-SCALER_DIR = cfg.scaler_dir
-
-
-# --- Model Definitions ---
-
-class NSSM(nn.Module):
-    def __init__(self, state_dim, input_dim, output_dim):
-        super().__init__()
-        self.state_dim = state_dim
-
-        self.f_net = nn.Sequential(
-            nn.Linear(state_dim + input_dim, 256),
-            nn.Tanh(),
-            nn.Linear(256, 256),
-            nn.Tanh(),
-            nn.Linear(256, state_dim),
-        )
-
-        self.g_net = nn.Sequential(
-            nn.Linear(state_dim, 32),
-            nn.Tanh(),
-            nn.Linear(32, output_dim),
-        )
-
-        self.d_net = nn.Linear(input_dim, output_dim, bias=False)
-
-    def forward(self, u_sequence, x_initial):
-        batch_size = u_sequence.shape[0]
-        seq_len = u_sequence.shape[1]
-
-        x_current = x_initial
-        y_pred_list = []
-
-        for t in range(seq_len):
-            u_t = u_sequence[:, t, :]
-            y_pred_t = self.g_net(x_current) + self.d_net(u_t)
-            y_pred_list.append(y_pred_t.unsqueeze(1))
-
-            xu_vec = torch.cat((x_current, u_t), dim=1)
-            x_next = self.f_net(xu_vec)
-            x_current = x_next
-
-        y_pred_sequence = torch.cat(y_pred_list, dim=1)
-        return y_pred_sequence
-
-
-class CascadedSystem(nn.Module):
-    def __init__(self, state_dim, raw_input_dim, history_window, output_dim):
-        super().__init__()
-        self.output_dim = output_dim
-
-        # Input: [u, diff] -> multiplier = 2
-        self.feature_multiplier = 2
-        base_input_dim = (raw_input_dim * self.feature_multiplier) * history_window
-
-        self.stages = nn.ModuleList()
-        curr_input_dim = base_input_dim
-
-        for i in range(output_dim):
-            # 每一個 Stage 都只預測 1 個維度 (一個關節)
-            self.stages.append(NSSM(state_dim, curr_input_dim, output_dim=1))
-            # 下一個 Stage 的輸入，必須包含上一個 Stage 預測出來的特徵 (所以維度 + 1)
-            curr_input_dim += 1
-
-    def forward(self, u_sequence, x_inits):
-        current_input = u_sequence
-        outputs = []
-
-        for i in range(self.output_dim):
-            # 把當前的輸入餵給第 i 個網路
-            pred = self.stages[i](current_input, x_inits[i])
-            outputs.append(pred)
-            current_input = torch.cat([current_input, pred.detach()], dim=2)
-
-        # 把所有階段的預測結果拼在一起回傳 [batch, seq_len, output_dim]
-        return torch.cat(outputs, dim=2)
-
-
-# --- Dataset ---
-
-class MotorData(Dataset):
-    def __init__(self, df, input_cols, target_cols, seq_len, history_window, scaler=None):
-        self.seq_len = seq_len
-        self.history_window = history_window
-
-        grouped = df.groupby('episode_id')
-
-        u_list = []
-        y_list = []
-
-        print(f"--- Processing {len(grouped)} episodes... ---")
-
-        for ep_id, group in sorted(grouped):
-            if len(group) == self.seq_len:
-                u_raw = group[input_cols].values
-                y_raw = group[target_cols].values
-
-                u_diff = np.zeros_like(u_raw)
-                u_diff[1:] = u_raw[1:] - u_raw[:-1]
-
-                # Feature: [u, diff]
-                u_features = np.concatenate([u_raw, u_diff], axis=1)
-
-                u_augmented = []
-                for i in range(history_window):
-                    u_shifted = np.roll(u_features, i, axis=0)
-                    u_shifted[:i] = 0.0
-                    u_augmented.append(u_shifted)
-
-                u_val = np.concatenate(u_augmented, axis=1)
-                u_list.append(u_val)
-                y_list.append(y_raw)
-
-        self.u_data = torch.tensor(np.array(u_list), dtype=torch.float32)
-        self.y_data = torch.tensor(np.array(y_list), dtype=torch.float32)
-
-        print(f"--- Valid Episodes: {self.u_data.shape[0]} / {len(grouped)} ---")
-
-        if scaler is None:
-            u_flat = self.u_data.view(-1, self.u_data.shape[-1])
-            y_flat = self.y_data.view(-1, self.y_data.shape[-1])
-
-            self.u_mean = u_flat.mean(dim=0)
-            self.u_std = u_flat.std(dim=0)
-            self.y_mean = y_flat.mean(dim=0)
-            self.y_std = y_flat.std(dim=0)
-
-            self.u_std[self.u_std < 1e-6] = 1.0
-            self.y_std[self.y_std < 1e-6] = 1.0
-        else:
-            self.u_mean = torch.tensor(scaler["u_mean"], dtype=torch.float32)
-            self.u_std = torch.tensor(scaler["u_std"], dtype=torch.float32)
-            self.y_mean = torch.tensor(scaler["y_mean"], dtype=torch.float32)
-            self.y_std = torch.tensor(scaler["y_std"], dtype=torch.float32)
-
-        self.u_data = (self.u_data - self.u_mean) / self.u_std
-        self.y_data = (self.y_data - self.y_mean) / self.y_std
-
-    def get_scaler_dict(self):
-        return {
-            "u_mean": self.u_mean.tolist(),
-            "u_std": self.u_std.tolist(),
-            "y_mean": self.y_mean.tolist(),
-            "y_std": self.y_std.tolist()
-        }
-
-    def __len__(self):
-        return self.u_data.shape[0]
-
-    def __getitem__(self, idx):
-        return self.u_data[idx], self.y_data[idx]
-
-
-# --- Helper Functions ---
-
-def calculate_r2(y_true, y_pred):
-    r2_total = 0.0
-    dim = y_true.shape[-1]
-    
-    for i in range(dim):
-        target_var = torch.var(y_true[:, :, i], unbiased=False)
-        if target_var < 1e-6:
-            target_var = 1.0
-
-        sse = torch.mean((y_true[:, :, i] - y_pred[:, :, i]) ** 2)
-        r2_total += 1.0 - (sse / target_var)
-        
-    return (r2_total / dim).item()
-
-
-def diff(x):
-    """計算序列的時間差分 (近似導數)"""
-    return x[:, 1:, :] - x[:, :-1, :]
-
-
-def get_interleaved_stratified_indices(total_episodes, mix_config, val_ratio=0.2):
-    indices_train = []
-    indices_val = []
-
-    current_start_id = 0
-    remaining_total = total_episodes
-
-    step = int(1 / val_ratio)
-
-    for item in mix_config:
-        # ratio = item[1]
-        ratio = item[1]
-
-        if item == mix_config[-1]:
-            count = remaining_total
-        else:
-            count = int(total_episodes * ratio)
-            remaining_total -= count
-
-        type_indices = np.arange(current_start_id, current_start_id + count)
-
-        v_idx = type_indices[::step]
-        v_set = set(v_idx)
-        t_idx = np.array([idx for idx in type_indices if idx not in v_set])
-
-        indices_train.extend(t_idx)
-        indices_val.extend(v_idx)
-        current_start_id += count
-
-    return indices_train, indices_val
-
-
-# --- Training Loop ---
-
-def train():
-    torch.manual_seed(42)
-    np.random.seed(42)
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(SCALER_DIR, exist_ok=True)
-
-    print(f"--- Start training ---")
-    print(f"--- Config: State={STATE_DIM}, Output={OUTPUT_DIM}, SeqLen={SEQ_LEN} ---")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    if not os.path.exists(DATA_FILE):
-        raise FileNotFoundError(f"Data file not found: {DATA_FILE}")
-
-    print(f"--- Loading CSV from {DATA_FILE} ---")
-    df = pd.read_csv(DATA_FILE)
-    df_cols = df.columns.tolist()
-
-    # --- 自動決定目標欄位 (兼容舊版與新版) ---
-    input_cols = ["input_u"]
-    j1_name = "vel_joint1" if "vel_joint1" in df_cols else "vel_joint"
-    
-    if OUTPUT_DIM == 2:
-        target_cols = ["vel_motor", j1_name]
-    elif OUTPUT_DIM == 3:
-        target_cols = ["vel_motor", j1_name, "vel_joint2"]
-    else:
-        raise ValueError(f"目前架構不支援 OUTPUT_DIM = {OUTPUT_DIM} (請設定 2 或 3)")
-
-    full_dataset = MotorData(df, input_cols, target_cols, SEQ_LEN, HISTORY_WINDOW, scaler=None)
-
-    scaler_dict = full_dataset.get_scaler_dict()
-    with open(SCALER_SAVE_PATH, "w") as f:
-        json.dump(scaler_dict, f, indent=4)
-    print(f"--- Scaler saved to {SCALER_SAVE_PATH} ---")
-
-    real_total_episodes = len(full_dataset)
-    train_indices, val_indices = get_interleaved_stratified_indices(
-        real_total_episodes,
-        cfg.signal_to_mix,
-        val_ratio=0.2
-    )
-
-    train_dataset = Subset(full_dataset, train_indices)
-    val_dataset = Subset(full_dataset, val_indices)
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-    # 初始化動態 Cascaded System
-    model = CascadedSystem(STATE_DIM, cfg.input_dim, HISTORY_WINDOW, OUTPUT_DIM).to(device)
-
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = ExponentialLR(optimizer, gamma=LR_DECAY_GAMMA)
-
-    run_name = f"{cfg.run_name}_dim{OUTPUT_DIM}_val_{int(time.time())}"
-    writer = SummaryWriter(f"runs/{run_name}")
-
-    print(f"--- 🚀 Launching TensorBoard (Background)... ---")
+import torch
+import torch.optim as optim
+from torch.optim.lr_scheduler import ExponentialLR
+from torch.utils.data import DataLoader, Subset
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # tensorboard is optional; training still runs without it
+    SummaryWriter = None
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "speed_control"))
+
+from speed_control.config import DEFAULT_CONFIG as cfg
+from speed_control.dataset import (
+    EpisodeDataset, describe_split, episode_signal_types, stratified_split,
+)
+from speed_control.metrics import r2_score
+from speed_control.model import build_model
+
+
+def set_seeds(config) -> None:
+    torch.manual_seed(config.seed)
+    if config.deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print("Determinism enabled: cuDNN autotuning off, runs are slower")
+
+
+def launch_tensorboard(config) -> None:
     try:
         subprocess.Popen(
-            ["tensorboard", "--logdir", "runs", "--port", "6006"],
+            ["tensorboard", "--logdir", "runs", "--port", str(config.tensorboard_port)],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
         )
-        print(f"--- ✅ TensorBoard is running at http://localhost:6006 ---")
-    except Exception as e:
-        print(f"--- ⚠️ Warning: Failed to auto-launch TensorBoard: {e}")
+        print(f"TensorBoard serving at http://localhost:{config.tensorboard_port}")
+    except OSError as error:
+        print(f"Warning: could not start TensorBoard: {error}")
 
-    best_val_loss = float("inf")
 
-    print("--- Training Loop Start ---")
-    for epoch in range(EPOCHS):
-        # --- Training ---
-        model.train()
-        train_loss_sum = 0.0
-        train_r2_sum = 0.0
+def sequence_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+    """Sum of per-channel mean squared error over the whole rollout."""
+    return sum(
+        torch.mean((y_true[:, :, c] - y_pred[:, :, c]) ** 2)
+        for c in range(y_true.shape[-1])
+    )
 
-        for u_batch, y_batch in train_loader:
+
+def run_epoch(model, loader, device, optimizer=None):
+    """Run one pass. Passing an optimizer switches to training mode."""
+    is_training = optimizer is not None
+    model.train(is_training)
+
+    loss_sum = 0.0
+    r2_sum = 0.0
+    with torch.set_grad_enabled(is_training):
+        for u_batch, y_batch in loader:
             u_batch = u_batch.to(device)
             y_batch = y_batch.to(device)
-            curr_batch_size = u_batch.size(0)
 
-            # 動態產生 N 個初始隱藏狀態 (對應各個關節網路)
-            x_inits = [torch.zeros(curr_batch_size, STATE_DIM).to(device) for _ in range(OUTPUT_DIM)]
+            y_pred = model(u_batch, model.initial_states(u_batch.size(0), device))
+            loss = sequence_loss(y_batch, y_pred)
 
-            y_pred = model(u_batch, x_inits)
+            if is_training:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-            # 動態加總 Loss
-            loss = 0.0
-            for i in range(OUTPUT_DIM):
-                loss += torch.mean((y_batch[:, :, i] - y_pred[:, :, i]) ** 2)
+            loss_sum += loss.item()
+            r2_sum += r2_score(y_batch.detach(), y_pred.detach())
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    return loss_sum / len(loader), r2_sum / len(loader)
 
-            train_loss_sum += loss.item()
-            with torch.no_grad():
-                train_r2_sum += calculate_r2(y_batch, y_pred)
 
-        avg_train_loss = train_loss_sum / len(train_loader)
-        avg_train_r2 = train_r2_sum / len(train_loader)
+def train() -> None:
+    set_seeds(cfg)
+    os.makedirs(cfg.model_dir, exist_ok=True)
+    os.makedirs(cfg.scaler_dir, exist_ok=True)
 
-        # --- Validation ---
-        model.eval()
-        val_loss_sum = 0.0
-        val_r2_sum = 0.0
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Working directory: {os.getcwd()}")
+    print(f"Device: {device}")
+    print(f"Model: state_dim={cfg.state_dim} output_dim={cfg.output_dim} "
+          f"seq_len={cfg.seq_len} history_window={cfg.history_window}")
 
-        with torch.no_grad():
-            for u_batch, y_batch in val_loader:
-                u_batch = u_batch.to(device)
-                y_batch = y_batch.to(device)
-                curr_batch_size = u_batch.size(0)
+    if not os.path.exists(cfg.data_file):
+        raise FileNotFoundError(f"Data file not found: {cfg.data_file}")
 
-                x_inits = [torch.zeros(curr_batch_size, STATE_DIM).to(device) for _ in range(OUTPUT_DIM)]
+    print(f"Loading {os.path.abspath(cfg.data_file)}")
+    df = pd.read_csv(cfg.data_file)
 
-                y_pred = model(u_batch, x_inits)
+    dataset = EpisodeDataset(df, cfg)
+    print(f"Episodes: {len(dataset)} usable of {df['episode_id'].nunique()} in file")
 
-                loss = 0.0
-                for i in range(OUTPUT_DIM):
-                    loss += torch.mean((y_batch[:, :, i] - y_pred[:, :, i]) ** 2)
+    dataset.scaler.save(cfg.scaler_save_path)
+    print(f"Scaler saved to {os.path.abspath(cfg.scaler_save_path)}")
 
-                val_loss_sum += loss.item()
-                val_r2_sum += calculate_r2(y_batch, y_pred)
+    signal_types = episode_signal_types(df, dataset, cfg)
+    train_indices, val_indices = stratified_split(signal_types, cfg)
+    print(f"Split at val_ratio={cfg.val_ratio}: "
+          f"{len(train_indices)} train / {len(val_indices)} val")
+    print(describe_split(signal_types, train_indices, val_indices))
 
-        avg_val_loss = val_loss_sum / len(val_loader)
-        avg_val_r2 = val_r2_sum / len(val_loader)
+    train_loader = DataLoader(
+        Subset(dataset, train_indices), batch_size=cfg.batch_size, shuffle=True
+    )
+    val_loader = DataLoader(
+        Subset(dataset, val_indices), batch_size=cfg.batch_size, shuffle=False
+    )
 
-        # --- Logging ---
-        curr_lr = optimizer.param_groups[0]["lr"]
+    model = build_model(cfg).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    scheduler = ExponentialLR(optimizer, gamma=cfg.lr_decay_gamma)
 
-        writer.add_scalars("Loss", {"Train": avg_train_loss, "Val": avg_val_loss}, epoch)
-        writer.add_scalars("Accuracy_R2", {"Train": avg_train_r2, "Val": avg_val_r2}, epoch)
+    writer = None
+    if SummaryWriter is None:
+        print("Warning: tensorboard is not installed, scalar logging disabled")
+    else:
+        run_dir = os.path.join("runs", f"{cfg.run_name}_{int(time.time())}")
+        writer = SummaryWriter(run_dir)
+        print(f"Logging to {run_dir}")
+        if cfg.launch_tensorboard:
+            launch_tensorboard(cfg)
 
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch [{epoch+1}/{EPOCHS}] | "
-                  f"Loss: {avg_train_loss:.5f}/{avg_val_loss:.5f} | "
-                  f"R2: {avg_train_r2*100:.1f}%/{avg_val_r2*100:.1f}% | "
-                  f"LR: {curr_lr:.8f}")
+    best_val_loss = float("inf")
+    print("Training start")
+    for epoch in range(cfg.epochs):
+        train_loss, train_r2 = run_epoch(model, train_loader, device, optimizer)
+        val_loss, val_r2 = run_epoch(model, val_loader, device)
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
-            print(f"   >>> Best Model Saved! Val Loss: {best_val_loss:.5f} (Acc: {avg_val_r2*100:.2f}%)")
+        if writer is not None:
+            writer.add_scalars("Loss", {"Train": train_loss, "Val": val_loss}, epoch)
+            writer.add_scalars("Accuracy_R2", {"Train": train_r2, "Val": val_r2}, epoch)
+
+        if (epoch + 1) % cfg.log_every == 0:
+            print(f"Epoch [{epoch + 1}/{cfg.epochs}] "
+                  f"loss {train_loss:.5f}/{val_loss:.5f} "
+                  f"R2 {train_r2 * 100:.1f}%/{val_r2 * 100:.1f}% "
+                  f"lr {optimizer.param_groups[0]['lr']:.2e}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), cfg.model_save_path)
+            print(f"  new best val loss {best_val_loss:.5f} "
+                  f"(R2 {val_r2 * 100:.2f}%), saved")
 
         scheduler.step()
 
-    writer.close()
-    print(f"--- Training Finished. Best Val Loss: {best_val_loss:.6f} ---")
+    if writer is not None:
+        writer.close()
+    print(f"Training finished. Best val loss: {best_val_loss:.6f}")
+    print(f"Model: {os.path.abspath(cfg.model_save_path)}")
 
 
 if __name__ == "__main__":

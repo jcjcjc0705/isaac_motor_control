@@ -1,9 +1,23 @@
+# ROS 2 / colcon build artefacts
 build/
 install/
 log/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Collected datasets and training outputs
 data/
 models/
 runs/
 plots/
 scalers/
-__pycache__/
+
+# Isaac Sim generated thumbnails
+.thumbs/
+
+# Large presentation source, kept out of the repository
+*.pptx

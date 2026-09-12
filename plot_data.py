@@ -1,162 +1,138 @@
-import matplotlib
-matplotlib.use('Agg') 
-import pandas as pd
-import matplotlib.pyplot as plt
-import os
+"""Inspect a collected dataset: limit violations and per-episode waveforms.
+
+All settings come from src/speed_control/speed_control/config.py. Edit that file
+and re-run; this script takes no command-line arguments.
+"""
+
 import glob
-import numpy as np
+import os
+import sys
 
-# ==========================================
-# 🎯 繪圖分析設定區 (請在這裡修改參數)
-# ==========================================
-DATA_DIR = "data" 
-HARD_LIMIT = 1.57
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# 1. 指定要分析的檔案 (留空 "" 或檔案不存在時，將自動抓取最新的 .csv)
-SPECIFIC_FILE = "train.csv"
+import pandas as pd
 
-# 2. 指定想要放大檢視的特定回合 ID (預設為 0)
-PLOT_EPISODE_ID = 0  
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "speed_control"))
 
-# 雖然不分階段過濾，但畫圖時標示出 Reset 起點還是很有幫助的
-RUN_STEPS = 200    
-# ==========================================
+from speed_control.config import DEFAULT_CONFIG as cfg
 
-def get_latest_csv(directory):
-    list_of_files = glob.glob(os.path.join(directory, "*.csv"))
-    if not list_of_files: return None
-    return max(list_of_files, key=os.path.getctime)
 
-def analyze_data(df):
-    # 自動偵測是否含有 joint2
-    has_joint2 = 'pos_joint2' in df.columns
+def resolve_csv(config) -> str:
+    """Use the configured file, falling back to the newest CSV in data_dir."""
+    if os.path.exists(config.inspect_file):
+        print(f"Reading {config.inspect_file}")
+        return config.inspect_file
 
-    # 1. 找出所有超過極限的資料點 (同時檢查 motor, joint1, 和 joint2)
-    exceed_mask = (df['pos_motor'].abs() > HARD_LIMIT) | (df['pos_joint1'].abs() > HARD_LIMIT)
+    print(f"Warning: {config.inspect_file} not found, falling back to the newest CSV")
+    candidates = glob.glob(os.path.join(config.data_dir, "*.csv"))
+    if not candidates:
+        raise FileNotFoundError(f"No CSV files under {config.data_dir}")
+
+    newest = max(candidates, key=os.path.getctime)
+    print(f"Reading {newest}")
+    return newest
+
+
+def report_limits(df: pd.DataFrame, config):
+    """Print how many episodes exceeded the hard limit, and which ones."""
+    has_joint2 = "pos_joint2" in df.columns
+
+    exceeded = (df["pos_motor"].abs() > config.hard_limit) | \
+               (df["pos_joint1"].abs() > config.hard_limit)
     if has_joint2:
-        exceed_mask = exceed_mask | (df['pos_joint2'].abs() > HARD_LIMIT)
-    
-    # 2. 抓出這些資料點對應的回合 ID
-    failed_episodes = df[exceed_mask]['episode_id'].unique().astype(int)
-    total_episodes = df['episode_id'].nunique()
-    
-    print(f"\n" + "="*45)
-    print(f"📊 數據極限分析報告")
-    print(f"---------------------------------------------")
-    print(f"總回合數: {total_episodes}")
-    print(f"系統配置: {'雙擺 (Motor + Joint1 + Joint2)' if has_joint2 else '單擺 (Motor + Joint1)'}")
-    print(f"❌ 發生超限的回合數: {len(failed_episodes)}")
-    
-    # 3. 印出超限的回合 ID
-    if len(failed_episodes) > 0:
-        print(f"⚠️ 超限的回合 ID: {failed_episodes.tolist()}")
-    else:
-        print(f"✨ 所有數據均符合安全規範，完全沒有超限！")
-    print("="*45 + "\n")
+        exceeded |= df["pos_joint2"].abs() > config.hard_limit
 
-    return failed_episodes, has_joint2
+    failed = df[exceeded]["episode_id"].unique().astype(int)
 
-def get_target_csv(directory, target_filename):
-    if target_filename:
-        if not target_filename.endswith('.csv'):
-            target_filename += '.csv'
-            
-        specific_path = os.path.join(directory, target_filename)
-        if os.path.exists(specific_path):
-            print(f"\n✅ 找到指定檔案: {specific_path}")
-            return specific_path
-        else:
-            print(f"\n⚠️ 找不到指定檔案 '{specific_path}'，將自動切換為最新檔案...")
-    
-    latest_file = get_latest_csv(directory)
-    if latest_file:
-        print(f"\n✅ 使用最新檔案: {latest_file}")
-    else:
-        print(f"\n❌ 錯誤：在 '{directory}' 目錄下找不到任何 CSV 檔案！")
-        
-    return latest_file
+    print("")
+    print("Dataset limit report")
+    print(f"  Layout         : {'motor + joint1 + joint2' if has_joint2 else 'motor + joint1'}")
+    print(f"  Episodes       : {df['episode_id'].nunique()}")
+    print(f"  Hard limit     : {config.hard_limit} rad")
+    print(f"  Rows exceeding : {int(exceeded.sum())} ({exceeded.mean() * 100:.2f}%)")
+    print(f"  Episodes hit   : {len(failed)}")
+    if len(failed):
+        print(f"  Episode ids    : {failed.tolist()}")
+    print("")
 
-def plot_motor_data():
-    csv_path = get_target_csv(DATA_DIR, SPECIFIC_FILE)
-    if not csv_path: 
-        return
-    
-    df = pd.read_csv(csv_path)
-    failed_eps, has_joint2 = analyze_data(df)
+    return failed, has_joint2
 
-    time_col = 'time_actual'
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 15))
-    
-    # --- 取得目標回合 ---
-    target_ep = PLOT_EPISODE_ID
-    if target_ep not in df['episode_id'].values:
-        print(f"⚠️ 找不到回合 ID {target_ep}，自動改為繪製第一回合 (ID: {int(df['episode_id'].iloc[0])})")
-        target_ep = df['episode_id'].iloc[0]
-        
-    subset = df[df['episode_id'] == target_ep]
-    
-    # ==========================================
-    # --- 子圖 1: 速度細節 (Velocity Detail) ---
-    # ==========================================
-    ax1.plot(subset[time_col], subset['input_u'], 'b--', alpha=0.6, label='Target (u)')
-    ax1.plot(subset[time_col], subset['vel_motor'], 'r-', alpha=0.4, label='Motor Vel')
-    ax1.plot(subset[time_col], subset['vel_joint1'], 'g-', label='Joint1 Vel')
-    
+
+def plot_dataset(df: pd.DataFrame, config, failed_episodes, has_joint2, csv_path: str) -> str:
+    time_col = "time_actual"
+
+    episode_id = config.inspect_episode_id
+    if episode_id not in df["episode_id"].values:
+        episode_id = df["episode_id"].iloc[0]
+        print(f"Warning: episode {config.inspect_episode_id} not present, "
+              f"plotting episode {int(episode_id)} instead")
+    episode = df[df["episode_id"] == episode_id]
+
+    _, (ax_velocity, ax_position, ax_overview) = plt.subplots(3, 1, figsize=(14, 15))
+
+    # matplotlib cannot index a pandas Series directly; hand it plain arrays.
+    episode_time = episode[time_col].to_numpy()
+    session_time = df[time_col].to_numpy()
+
+    ax_velocity.plot(episode_time, episode["input_u"].to_numpy(), "b--", alpha=0.6, label="Input (u)")
+    ax_velocity.plot(episode_time, episode["vel_motor"].to_numpy(), "r-", alpha=0.4, label="Motor vel")
+    ax_velocity.plot(episode_time, episode["vel_joint1"].to_numpy(), "g-", label="Joint1 vel")
     if has_joint2:
-        ax1.plot(subset[time_col], subset['vel_joint2'], 'm-', alpha=0.8, label='Joint2 Vel')
-    
-    reset_idx = min(RUN_STEPS - 1, len(subset) - 1)
-    if reset_idx > 0:
-        ax1.axvline(x=subset[time_col].iloc[reset_idx], color='orange', linestyle=':', label='Reset Start')
-        
-    ax1.set_title(f"Velocity Detail (Episode {int(target_ep)})")
-    ax1.legend(loc='upper right')
-    ax1.grid(True, alpha=0.3)
+        ax_velocity.plot(episode_time, episode["vel_joint2"].to_numpy(), "m-", alpha=0.8, label="Joint2 vel")
 
-    # ==========================================
-    # --- 子圖 2: 位置細節 (Position Detail) ---
-    # ==========================================
-    ax2.plot(subset[time_col], subset['pos_motor'], 'r-', alpha=0.4, label='Motor Pos')
-    ax2.plot(subset[time_col], subset['pos_joint1'], 'g-', label='Joint1 Pos')
-    
+    reset_index = min(config.episode_len - 1, len(episode) - 1)
+    if reset_index > 0:
+        ax_velocity.axvline(x=episode_time[reset_index], color="orange",
+                            linestyle=":", label="Reset phase start")
+    ax_velocity.set_title(f"Velocity detail (episode {int(episode_id)})")
+    ax_velocity.legend(loc="upper right")
+    ax_velocity.grid(True, alpha=0.3)
+
+    ax_position.plot(episode_time, episode["pos_motor"].to_numpy(), "r-", alpha=0.4, label="Motor pos")
+    ax_position.plot(episode_time, episode["pos_joint1"].to_numpy(), "g-", label="Joint1 pos")
     if has_joint2:
-        ax2.plot(subset[time_col], subset['pos_joint2'], 'm-', alpha=0.8, label='Joint2 Pos')
+        ax_position.plot(episode_time, episode["pos_joint2"].to_numpy(), "m-", alpha=0.8, label="Joint2 pos")
+    for sign in (1, -1):
+        ax_position.axhline(y=sign * config.hard_limit, color="r", linestyle="-.", alpha=0.8)
+    ax_position.set_title(f"Position detail (episode {int(episode_id)})")
+    ax_position.legend(loc="upper right")
+    ax_position.grid(True, alpha=0.3)
 
-    ax2.axhline(y=HARD_LIMIT, color='r', linestyle='-.', alpha=0.8)
-    ax2.axhline(y=-HARD_LIMIT, color='r', linestyle='-.', alpha=0.8)
-    ax2.set_title(f"Position Detail (Episode {int(target_ep)})")
-    ax2.legend(loc='upper right')
-    ax2.grid(True, alpha=0.3)
-
-    # ==========================================
-    # --- 子圖 3: 全局視圖 (Full Overview) ---
-    # ==========================================
-    ax3.plot(df[time_col], df['pos_joint1'], color='green', alpha=0.5, label='Joint1')
+    ax_overview.plot(session_time, df["pos_joint1"].to_numpy(), color="green", alpha=0.5, label="Joint1")
     if has_joint2:
-        ax3.plot(df[time_col], df['pos_joint2'], color='purple', alpha=0.5, label='Joint2')
-        
-    ax3.axhline(y=HARD_LIMIT, color='red', linestyle='-.', alpha=0.8)
-    ax3.axhline(y=-HARD_LIMIT, color='red', linestyle='-.', alpha=0.8)
-    
-    first_fail_labeled = False
-    for ep_id, group in df.groupby('episode_id'):
-        if ep_id in failed_eps:
-            t_start, t_end = group[time_col].min(), group[time_col].max()
-            label = 'Exceed Limit' if not first_fail_labeled else ""
-            ax3.axvspan(t_start, t_end, color='red', alpha=0.3, label=label)
-            first_fail_labeled = True
-            
-    ax3.set_title("Full Overview (Red highlights indicate limit exceedance)")
-    ax3.set_xlabel("Time [sec]")
-    ax3.legend(loc='upper right')
-    ax3.grid(True, alpha=0.3)
-    
+        ax_overview.plot(session_time, df["pos_joint2"].to_numpy(), color="purple", alpha=0.5, label="Joint2")
+    for sign in (1, -1):
+        ax_overview.axhline(y=sign * config.hard_limit, color="red", linestyle="-.", alpha=0.8)
+
+    labelled = False
+    for episode_key, group in df.groupby("episode_id"):
+        if episode_key in failed_episodes:
+            ax_overview.axvspan(group[time_col].min(), group[time_col].max(),
+                                color="red", alpha=0.3,
+                                label="" if labelled else "Exceeds limit")
+            labelled = True
+    ax_overview.set_title("Full session overview (red spans exceed the hard limit)")
+    ax_overview.set_xlabel("Time [s]")
+    ax_overview.legend(loc="upper right")
+    ax_overview.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    output_png = os.path.join(DATA_DIR, os.path.basename(csv_path).replace('.csv', '_analysis.png'))
-    plt.savefig(output_png)
+    output = os.path.join(
+        config.data_dir, os.path.basename(csv_path).replace(".csv", "_analysis.png")
+    )
+    plt.savefig(output)
     plt.close()
-    
-    print(f"✅ 分析圖表已儲存至: {output_png}")
+    return output
+
+
+def main() -> None:
+    csv_path = resolve_csv(cfg)
+    df = pd.read_csv(csv_path)
+    failed_episodes, has_joint2 = report_limits(df, cfg)
+    print(f"Saved {plot_dataset(df, cfg, failed_episodes, has_joint2, csv_path)}")
+
 
 if __name__ == "__main__":
-    plot_motor_data()
+    main()

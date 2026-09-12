@@ -1,0 +1,27 @@
+# Conda environment for the training side only.
+#
+# The ROS side (data collection, gain calibration) must run on the interpreter
+# that ROS 2 was built against, not on this environment. See the README section
+# "兩個直譯器".
+#
+#   conda env create -f environment.yml
+#   conda activate motor-control
+#
+# Install the torch build that matches your CUDA version if the default wheel
+# does not: https://pytorch.org/get-started/locally/
+
+name: motor-control
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - pip
+  - pip:
+      - torch
+      - tensorboard

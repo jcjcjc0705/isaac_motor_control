@@ -4,7 +4,7 @@ package_name = 'speed_control'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='0.1.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='pochun',
     maintainer_email='pochun@todo.todo',
-    description='TODO: Package description',
+    description='Excitation-signal data collection for motor dynamics identification in Isaac Sim.',
     license='TODO: License declaration',
     extras_require={
         'test': [
@@ -24,8 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'test = speed_control.speed_control_test:main',
             'data_collector = speed_control.data_collection:main',
+            'gain_calibration = speed_control.limit_test:main',
         ],
     },
 )
