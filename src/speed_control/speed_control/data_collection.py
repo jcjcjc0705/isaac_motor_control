@@ -346,18 +346,19 @@ def prompt_gain(cfg=DEFAULT_CONFIG) -> float:
 
 
 def report_planned_travel(cfg) -> None:
-    """Print the amplitude and excursion the entered gain implies.
+    """Print the travel the entered gain implies, before any effort is published.
 
-    Printed before any effort is published, so an implausible gain shows up as
-    an implausible excursion here rather than part-way through a collection.
+    An implausible gain shows up here as an implausible excursion, rather than
+    part-way through a collection.
     """
     print("")
     print(f"  effort_to_pos_gain   : {cfg.effort_to_pos_gain:.3f} rad per unit effort")
-    print(f"  excitation amplitude : {cfg.amplitude:.3f} effort units "
-          f"(derived, not configured)")
-    print(f"  predicted excursion  : {cfg.amplitude * cfg.effort_to_pos_gain:.3f} rad "
-          f"({math.degrees(cfg.amplitude * cfg.effort_to_pos_gain):.1f} deg), "
+    print(f"  plant_time_constant  : {cfg.plant_time_constant:.2f} s")
+    print(f"  travel aimed at      : {cfg.safe_travel:.3f} rad "
+          f"({math.degrees(cfg.safe_travel):.1f} deg) at full travel share, "
           f"against a {cfg.hard_limit:.3f} rad limit")
+    print(f"  held effort for that : {cfg.held_effort_amplitude:.3f} effort units; "
+          f"faster waveforms are given more, up to {cfg.max_effort:.2f}")
 
 
 def main(args=None) -> None:

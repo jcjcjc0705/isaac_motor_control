@@ -3,9 +3,10 @@
 Pure NumPy with no ROS dependency, so waveforms can be generated and plotted
 without launching the simulator.
 
-Every generator shapes its output so the plant is predicted to stay inside
-``cfg.planner_safe_limit``. The prediction is a crude one, and the collector
-enforces a real-time abort on top of it.
+Every generator produces a waveform shape at unit amplitude, which
+:func:`render_signal` then scales so the excursion it is predicted to produce
+is the share of ``cfg.planner_safe_limit`` that the episode plan asks for. The
+collector enforces a real-time abort on top of that prediction.
 """
 
 import math
@@ -20,10 +21,15 @@ from .config import ExperimentConfig
 
 
 class EpisodePlan(NamedTuple):
-    """One episode's excitation recipe."""
+    """One episode's excitation recipe.
+
+    ``travel_fraction`` is the share of the safe band the episode should fill,
+    so the effort it takes to get there is worked out per waveform rather than
+    being carried here.
+    """
 
     signal_type: str
-    amplitude: float
+    travel_fraction: float
     param_range: Optional[Tuple[float, float]]
     sign: int
 
@@ -38,27 +44,71 @@ def seed_everything(seed: int) -> None:
 # Safety shaping
 # ----------------------------------------------------------------------
 
-def predict_peak(u: np.ndarray, gain: float) -> float:
+def low_pass(u: np.ndarray, tau: float, dt: float) -> np.ndarray:
+    """One-pole low-pass filter, the shape of the plant's approach to an angle."""
+    u = np.asarray(u, dtype=float)
+    if tau <= 0.0:
+        return u.copy()
+    alpha = dt / (tau + dt)
+    filtered = np.zeros_like(u)
+    value = 0.0
+    for index, sample in enumerate(u):
+        value += alpha * (sample - value)
+        filtered[index] = value
+    return filtered
+
+
+def predict_peak(u: np.ndarray, cfg: ExperimentConfig) -> float:
     """Predict the largest joint excursion a command sequence will produce.
 
-    A held effort settles at the angle where gravity balances it, so the
-    excursion follows the command's peak rather than its integral and the
-    prediction is a single multiplication by ``gain``, the radians per unit of
-    effort held in ``cfg.effort_to_pos_gain``.
+    A held effort settles at the angle where gravity balances it, so a command
+    that holds still long enough reaches ``effort_to_pos_gain`` radians per
+    unit, while one that reverses first does not get that far. Low-passing the
+    command with ``cfg.plant_time_constant`` before taking its peak reproduces
+    both ends: the filter passes a held level unchanged and attenuates a fast
+    alternating one in proportion to how little time it spends on one side.
 
     The gain belongs to whichever joint swings furthest, which on a linkage is
     not necessarily the driven one.
     """
-    return gain * float(np.max(np.abs(u)))
+    filtered = low_pass(u, cfg.plant_time_constant, cfg.dt)
+    return cfg.effort_to_pos_gain * float(np.max(np.abs(filtered)))
 
 
-def scale_to_safe_peak(u: np.ndarray, cfg: ExperimentConfig) -> np.ndarray:
-    """Uniformly shrink a waveform until its predicted peak fits the safe band."""
-    limit = cfg.planner_safe_limit - cfg.planner_margin
-    peak = predict_peak(u, cfg.effort_to_pos_gain)
-    if peak > limit:
-        u = u * (limit / peak)
-    return u
+def predict_abort_measure(u: np.ndarray, cfg: ExperimentConfig) -> float:
+    """Predict the largest value the collector's abort test will see.
+
+    That test watches position plus ``cfg.lookahead`` seconds of velocity, so a
+    waveform can pass :func:`predict_peak` on position and still trip it by
+    being fast. Differentiating the same filtered command gives the velocity
+    term, which makes this the command-side form of the abort test.
+    """
+    filtered = low_pass(u, cfg.plant_time_constant, cfg.dt)
+    rate = np.gradient(filtered, cfg.dt)
+    return cfg.effort_to_pos_gain * float(
+        np.max(np.abs(filtered + cfg.lookahead * rate))
+    )
+
+
+def fit_to_travel(u: np.ndarray, cfg: ExperimentConfig, travel_fraction: float) -> np.ndarray:
+    """Scale a waveform to the travel it is asked for, without tripping the abort.
+
+    The position scaling runs in both directions: a waveform that would
+    overshoot the band is shrunk, and one that would barely move the rig is
+    grown, which is what lets every signal type use the same share of the
+    travel. A waveform whose speed would then trip the abort test is shrunk
+    further, so only the fast ones pay for it. The result is clipped to
+    ``cfg.max_effort``, the ceiling on anything published.
+    """
+    peak = predict_peak(u, cfg)
+    if peak < 1e-9:
+        return np.zeros_like(u, dtype=float)
+    scale = travel_fraction * cfg.safe_travel / peak
+
+    measure = scale * predict_abort_measure(u, cfg)
+    if measure > cfg.planner_lookahead_limit:
+        scale *= cfg.planner_lookahead_limit / measure
+    return np.clip(u * scale, -cfg.max_effort, cfg.max_effort)
 
 
 def limit_slew_rate(signal: np.ndarray, max_step: float) -> np.ndarray:
@@ -78,9 +128,9 @@ def limit_slew_rate(signal: np.ndarray, max_step: float) -> np.ndarray:
 def _make_prbs(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
     """Alternating-sign square pulses with randomised hold times.
 
-    ``plan.param_range`` is the hold time in steps. Hold time does not bound
-    the excursion -- a joint stops at the angle that balances the torque and
-    stays there -- so the level is what the peak scaling shapes.
+    ``plan.param_range`` is the hold time in steps. It is what decides how far
+    a given level carries the joint, so it also decides the effort the peak
+    prediction ends up asking for.
     """
     u = np.zeros(length)
     min_hold, max_hold = int(plan.param_range[0]), int(plan.param_range[1])
@@ -88,12 +138,12 @@ def _make_prbs(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndar
     index = 0
     sign = plan.sign
     while index < length:
-        level = sign * np.random.uniform(0.3 * plan.amplitude, plan.amplitude)
+        level = sign * np.random.uniform(0.3, 1.0)
         end = min(index + np.random.randint(min_hold, max_hold + 1), length)
         u[index:end] = level
         sign *= -1
         index = end
-    return scale_to_safe_peak(u, cfg)
+    return u
 
 
 def _make_ramps(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
@@ -109,21 +159,20 @@ def _make_ramps(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.nda
         half_period_steps = max(1, int((1.0 / (2.0 * frequency)) / cfg.dt))
         end = min(index + half_period_steps, length)
 
-        target = sign * np.random.uniform(0.3 * plan.amplitude, plan.amplitude)
+        target = sign * np.random.uniform(0.3, 1.0)
         u[index:end] = np.linspace(last_value, target, end - index)
 
         last_value = target
         sign *= -1
         index = end
-    return scale_to_safe_peak(u, cfg)
+    return u
 
 
 def _make_chirp(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
     """Linear frequency sweep across the plan's range."""
     t = np.arange(length) * cfg.dt
     low, high = plan.param_range
-    u = plan.sign * plan.amplitude * chirp(t, f0=low, t1=t[-1], f1=high, method="linear")
-    return scale_to_safe_peak(u, cfg)
+    return plan.sign * chirp(t, f0=low, t1=t[-1], f1=high, method="linear")
 
 
 def _make_multisine(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
@@ -144,8 +193,8 @@ def _make_multisine(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np
         normaliser += 1.5
 
     if normaliser > 0:
-        u = (u / normaliser) * plan.amplitude
-    return scale_to_safe_peak(u, cfg)
+        u = u / normaliser
+    return u
 
 
 def _make_smooth_noise(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
@@ -154,13 +203,12 @@ def _make_smooth_noise(cfg: ExperimentConfig, plan: EpisodePlan, length: int) ->
     num_points = length // spacing + 2
 
     x_key = np.linspace(0, length, num_points)
-    magnitudes = np.random.uniform(0.1 * plan.amplitude, plan.amplitude, num_points)
+    magnitudes = np.random.uniform(0.1, 1.0, num_points)
     signs = np.ones(num_points)
     signs[1::2] = -1
 
     spline = interp1d(x_key, magnitudes * signs, kind="cubic", fill_value="extrapolate")
-    u = np.clip(spline(np.arange(length)), -plan.amplitude, plan.amplitude)
-    return scale_to_safe_peak(u, cfg)
+    return np.clip(spline(np.arange(length)), -1.0, 1.0)
 
 
 GENERATORS = {
@@ -173,13 +221,15 @@ GENERATORS = {
 
 
 def render_signal(cfg: ExperimentConfig, plan: EpisodePlan, length: int) -> np.ndarray:
-    """Build the command sequence for one episode."""
+    """Build the command sequence for one episode, scaled to its travel share."""
     generator = GENERATORS.get(plan.signal_type)
     if generator is None:
         raise ValueError(
             f"Unknown signal type {plan.signal_type!r}, expected one of {sorted(GENERATORS)}"
         )
-    return limit_slew_rate(generator(cfg, plan, length), cfg.max_slew_rate)
+    shape = generator(cfg, plan, length)
+    return limit_slew_rate(fit_to_travel(shape, cfg, plan.travel_fraction),
+                           cfg.max_slew_rate)
 
 
 # ----------------------------------------------------------------------
@@ -206,16 +256,15 @@ def build_type_schedule(
     signal_type: str,
     num_episodes: int,
     ranges: Dict[str, Tuple[float, float]],
-    base_amplitude: float,
 ) -> List[EpisodePlan]:
-    """Grid-sweep amplitude x sub-range x sign for one signal type."""
-    amplitude_scales = [0.4, 0.6, 0.8, 1.0]
+    """Grid-sweep travel share x sub-range x sign for one signal type."""
+    travel_fractions = [0.4, 0.6, 0.8, 1.0]
     signs = [1, -1]
     full_range = ranges.get(signal_type, (0.1, 1.0))
 
     schedule: List[EpisodePlan] = []
     while len(schedule) < num_episodes:
-        for scale in amplitude_scales:
+        for fraction in travel_fractions:
             for splits in frequency_split_levels(num_episodes):
                 edges = np.linspace(full_range[0], full_range[1], splits + 1)
                 # PRBS ranges are integer hold steps; collapse degenerate splits.
@@ -225,7 +274,7 @@ def build_type_schedule(
                     for sign in signs:
                         schedule.append(EpisodePlan(
                             signal_type=signal_type,
-                            amplitude=scale * base_amplitude,
+                            travel_fraction=fraction,
                             param_range=(edges[i], edges[i + 1]),
                             sign=sign,
                         ))
@@ -253,7 +302,7 @@ def build_training_schedule(cfg: ExperimentConfig) -> List[EpisodePlan]:
     """
     counts = split_episode_counts(cfg.total_episodes, cfg.signal_mix)
     per_type = {
-        name: build_type_schedule(name, count, cfg.signal_ranges, cfg.amplitude)
+        name: build_type_schedule(name, count, cfg.signal_ranges)
         for name, count in counts.items()
     }
 
@@ -269,6 +318,7 @@ def build_training_schedule(cfg: ExperimentConfig) -> List[EpisodePlan]:
 def build_test_schedule(cfg: ExperimentConfig) -> List[EpisodePlan]:
     """Uniform schedule for the held-out test set."""
     return [
-        EpisodePlan(cfg.test_signal_type, cfg.amplitude, cfg.signal_ranges.get(cfg.test_signal_type), 1)
+        EpisodePlan(cfg.test_signal_type, 1.0,
+                    cfg.signal_ranges.get(cfg.test_signal_type), 1)
         for _ in range(cfg.test_episodes)
     ]

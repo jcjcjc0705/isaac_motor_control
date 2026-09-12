@@ -101,6 +101,12 @@ class ExperimentConfig:
     abort_limit: float = 1.4         # 80 deg, hands the motor to the recovery controller
     planner_safe_limit: float = 1.2  # 69 deg, the angle signals are shaped to fit
     planner_margin: float = 0.05     # headroom kept below planner_safe_limit
+    # Band on the planner's estimate of position plus lookahead velocity, the
+    # quantity the collector aborts on when it passes hard_limit. It sits below
+    # hard_limit because the estimate carries the same spread as the position
+    # one. Only fast waveforms are held back by it; a slow one is bounded by
+    # planner_safe_limit first.
+    planner_lookahead_limit: float = 1.35
     # Radians of excursion per unit of held effort, measured by collector mode
     # 3. It describes the mechanism -- links, masses, friction -- so it has to
     # be re-measured whenever any of those change, and it is what modes 1 and 2
@@ -111,6 +117,13 @@ class ExperimentConfig:
     # signal generators ask how far a waveform throws a joint, which includes
     # the overshoot on the way to the equilibrium angle.
     effort_to_pos_gain: float = 1.15
+    # Seconds. The plant reaches the angle above only if the effort stays put;
+    # a command that reverses sooner does not get that far. The peak predictor
+    # low-passes the command with this time constant before scaling it by the
+    # gain, which leaves a held effort at the full gain and attenuates a fast
+    # alternating one. Measured by comparing the prediction against the
+    # excursions a collected dataset actually reached.
+    plant_time_constant: float = 0.3
     max_slew_rate: float = 500.0     # largest step-to-step change in the command
     lookahead: float = 0.2           # seconds of forward prediction before aborting
 
@@ -155,7 +168,7 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Data inspection (plot_data.py)
     # ------------------------------------------------------------------
-    inspect_file: str = "data/train.csv"
+    inspect_file: str = "data/test.csv"
     inspect_episode_id: int = 0
 
     # ------------------------------------------------------------------
@@ -167,16 +180,21 @@ class ExperimentConfig:
         return self.episode_len + self.reset_len
 
     @property
-    def amplitude(self) -> float:
-        """Largest |effort| an episode may ask for, in effort units.
+    def safe_travel(self) -> float:
+        """Radians of excursion an episode at full travel share is aimed at."""
+        return self.planner_safe_limit - self.planner_margin
 
-        This is the effort whose predicted excursion exactly fills the safe
-        band, so the schedule randomises amplitudes underneath it and the
-        planner has nothing left to trim. It follows effort_to_pos_gain, which
-        is why entering a freshly measured gain is enough to fit a collection
-        to a new mechanism.
+    @property
+    def held_effort_amplitude(self) -> float:
+        """The effort that fills the safe band when simply held, in effort units.
+
+        Only the slowest waveforms are scaled to about this much; a fast one is
+        given more, since it reverses before the joint has travelled that far.
+        It is the reference the startup report prints, and it follows
+        effort_to_pos_gain, which is why entering a freshly measured gain is
+        enough to fit a collection to a new mechanism.
         """
-        return (self.planner_safe_limit - self.planner_margin) / self.effort_to_pos_gain
+        return self.safe_travel / self.effort_to_pos_gain
 
     @property
     def input_dim(self) -> int:

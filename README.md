@@ -100,8 +100,9 @@ src/speed_control/speed_control/config.py
 | CSV 欄位 | `input_cols`, `target_cols` | `output_dim` 由 `target_cols` 長度自動推導 |
 | 模型 | `state_dim`, `history_window` | 狀態階數與堆疊的歷史命令步數 |
 | 訓練 | `batch_size`, `learning_rate`, `epochs`, `val_ratio`, `seed`, `deterministic` | `deterministic=True` 會開啟 cuDNN 決定性，較慢但可重現 |
-| 激勵訊號 | `signal_mix`, `signal_ranges` | 各訊號種類的配比與參數範圍；振幅由 `effort_to_pos_gain` 推導，不是設定值 |
-| 安全極限 | `hard_limit`, `abort_limit`, `planner_safe_limit`, `effort_to_pos_gain` | 見下方「安全機制」 |
+| 激勵訊號 | `signal_mix`, `signal_ranges` | 各訊號種類的配比與參數範圍；振幅不是設定值，由規劃器依預測擺幅推算 |
+| 安全極限 | `hard_limit`, `abort_limit`, `planner_safe_limit`, `planner_lookahead_limit` | 見下方「安全機制」 |
+| 機構增益 | `effort_to_pos_gain`, `plant_time_constant` | 由模式 3 與資料量得，決定規劃器的預測 |
 | 歸零控制 | `reset_kp`, `reset_kd`, `max_effort` | 歸零段與中止後把馬達交給誰處理 |
 | 增益校正 | `calib_start_effort`, `calib_effort_step`, `calib_effort`, `calib_limit` | 模式 3 的施力範圍與中止角度 |
 | 可視化 | `viz_train_episodes`, `viz_test_start`, `viz_channels` | 要畫哪些回合、測試檔切片範圍、要畫哪些通道 |
@@ -177,7 +178,8 @@ ros2 run speed_control gain_calibration
 訊號產生器問的是「一段波形會把關節甩到多遠」，所以要用含過衝的 peak gain。
 
 這個增益描述的是機構本身（連桿、質量、摩擦），改動任何一項就得重測。
-激勵振幅由它推導而來，所以重測這一個數字就足以讓整輪收集留在行程內。
+激勵振幅由它推算而來，所以重測這一個數字就足以讓整輪收集留在行程內。
+`plant_time_constant` 則是換過機構後用第一份收好的資料回頭校正（見「擺幅怎麼預測」）。
 
 ### 5. 蒐集資料（ROS 終端機）
 
@@ -195,12 +197,13 @@ ros2 run speed_control data_collector     # 選 1 收訓練資料，選 2 收測
 effort_to_pos_gain [1.15]:
 ```
 
-接著會印出這個增益推導出的振幅與預測擺幅，可在送出第一個命令前確認合理：
+接著會印出這個增益對應的行程，可在送出第一個命令前確認合理：
 
 ```
   effort_to_pos_gain   : 1.150 rad per unit effort
-  excitation amplitude : 1.000 effort units (derived, not configured)
-  predicted excursion  : 1.150 rad (65.9 deg), against a 1.570 rad limit
+  plant_time_constant  : 0.30 s
+  travel aimed at      : 1.150 rad (65.9 deg) at full travel share, against a 1.570 rad limit
+  held effort for that : 1.000 effort units; faster waveforms are given more, up to 2.50
 ```
 
 這個值在排程建立時就要定案，所以只能在這裡問，不能等 node 起來之後再改。
@@ -314,25 +317,43 @@ x_{t+1} = (1 - a) x_t + a f(x_t, u_t)
 
 ## 安全機制
 
-行程保護分三層，由寬到緊：
+行程保護分四層，由寬到緊：
 
-1. **`planner_safe_limit`（1.2 rad）** —— 訊號產生器的規劃上限。持續施加一個力矩時，
-   關節會停在重力與之平衡的角度，所以擺幅取決於命令的峰值而非積分，預估只是一個
-   乘法：`effort_to_pos_gain × max|u|`。超過就整段等比例縮小。
-2. **`abort_limit`（1.4 rad）** —— 執行期即時保護。每步用 `lookahead` 秒做前瞻預測，
+1. **`planner_safe_limit`（1.2 rad）** —— 規劃器的位置上限。每個回合的波形都會被
+   縮放到「預測擺幅 = `travel_fraction` × 安全帶」，排程把 `travel_fraction` 掃過
+   0.4 / 0.6 / 0.8 / 1.0。
+2. **`planner_lookahead_limit`（1.35 rad）** —— 規劃器的速度上限。位置合格的波形仍
+   可能因為太快而踩到中止層，所以另外預測一次「位置 + `lookahead` 秒的速度」，
+   超過就再縮。只有快速的波形會被它壓低。
+3. **`abort_limit`（1.4 rad）** —— 執行期即時保護。每步用 `lookahead` 秒做前瞻預測，
    一旦當前或預測位置越界，立刻放棄該回合剩餘的激勵訊號，把馬達交給歸零控制器。
-3. **`hard_limit`（1.57 rad，90 度）** —— 機構行程極限，用於事後統計。
+4. **`hard_limit`（1.57 rad，90 度）** —— 機構行程極限，用於事後統計。
    存檔時會報告有多少列、哪些回合曾經超過此值，以及是否出現非有限值。
 
-激勵振幅（`cfg.amplitude`）是推導值而非設定值：
+### 擺幅怎麼預測
+
+持續施力時關節會停在重力與之平衡的角度，快速反向則來不及走到那裡。把命令先用
+`plant_time_constant` 做一階低通再取峰值，就同時描述這兩端 —— 低通對持續的準位沒有
+衰減，對快速交替的訊號則按它停留的時間比例衰減：
 
 ```
-amplitude = (planner_safe_limit - planner_margin) / effort_to_pos_gain
+預測擺幅 = effort_to_pos_gain × max| lowpass(u, plant_time_constant) |
+預測前瞻 = effort_to_pos_gain × max| lowpass(u) + lookahead × d/dt lowpass(u) |
 ```
 
-也就是「預測擺幅剛好填滿安全帶」的那個力矩。排程的隨機振幅因此都落在上限之下，
-規劃器沒有東西需要修剪；設得比它高不會換到更大行程，只會讓超過的回合全部被修剪成
-同一個振幅，失去振幅的多樣性。
+所以**激勵振幅不是設定值**：波形以單位振幅產生，再縮放到上面兩個預測都合格為止，
+最後截在 `max_effort`。慢速訊號需要的力矩接近
+`(planner_safe_limit - planner_margin) / effort_to_pos_gain`，快速訊號需要更多。
+這讓五種訊號都用到同一份行程，而不是讓快速訊號只擺一半。
+
+`plant_time_constant` 的校法是拿一份收好的資料，比較預測擺幅與實際擺幅：
+比值中位數為 1 的那個 tau 就是它。預測對持續施力（DC）的行為與 `effort_to_pos_gain`
+的定義一致，所以 PRBS 這類訊號的上界不受這個 tau 影響。
+
+預測會有散度（實測範圍約 0.85–1.2 倍），安全帶與中止門檻之間的差距就是留給它的。
+MULTISINE 是最容易低估的一種，因為低通模型沒有共振峰而它每回合都含共振附近的頻率；
+實測會偶爾踩到中止層，截掉激勵段最後幾步。若要完全避免，把 `planner_safe_limit`
+降到 1.15。
 
 歸零控制器的 `reset_kp` 與 `reset_kd` 預設為 0，也就是不施力、讓關節靠自身摩擦
 滑行到停止。若機構無法自行停下再調高它們，但那會把歸零段變成一個經由模擬器往返
