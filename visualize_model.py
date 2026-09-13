@@ -71,7 +71,7 @@ def plot_episode(label, group: pd.DataFrame, y_pred: np.ndarray, config) -> str:
 
     plt.subplot(num_panels, 1, 1)
     plt.plot(time_axis, group[config.input_cols[0]].values, "k--", label="Input")
-    plt.title("Input signal (effort command)")
+    plt.title(f"Input signal ({config.input_cols[0]})")
     plt.legend(loc="upper right")
     plt.grid(True, alpha=0.3)
 

@@ -28,11 +28,18 @@ class JointStateTracker:
     Positions are wrapped to +/-pi as they arrive, so every consumer sees the
     same angle. ``has_joint2`` reports whether the scene published a second
     link, which is detected from the messages rather than configured.
+
+    ``motor_effort`` is the effort the simulator reports it applied, which
+    arrives in the same message as the pose it produced. A command published on
+    /joint_command reaches the joint some messages later, so the two are not
+    interchangeable: the command says what was asked for, this says what the
+    joint actually got.
     """
 
     def __init__(self):
         self.motor_pos = 0.0
         self.motor_vel = 0.0
+        self.motor_effort = 0.0
         self.joint1_pos = 0.0
         self.joint1_vel = 0.0
         self.joint2_pos = 0.0
@@ -47,6 +54,9 @@ class JointStateTracker:
             if name in MOTOR_NAMES:
                 self.motor_pos = wrap_to_pi(msg.position[index])
                 self.motor_vel = msg.velocity[index]
+                self.motor_effort = (
+                    msg.effort[index] if index < len(msg.effort) else 0.0
+                )
             elif name in JOINT1_NAMES:
                 self.joint1_pos = wrap_to_pi(msg.position[index])
                 self.joint1_vel = msg.velocity[index]
@@ -61,7 +71,7 @@ class JointStateTracker:
 
     def is_finite(self) -> bool:
         """False once the simulator has diverged and is publishing NaN."""
-        return all(math.isfinite(v) for v in self.as_row())
+        return all(math.isfinite(v) for v in self.as_row() + [self.motor_effort])
 
     def max_abs_position(self) -> float:
         positions = [abs(self.motor_pos), abs(self.joint1_pos)]

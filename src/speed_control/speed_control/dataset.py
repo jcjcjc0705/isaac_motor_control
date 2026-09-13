@@ -34,6 +34,16 @@ class EpisodeDataset(Dataset):
         commands: List[np.ndarray] = []
         responses: List[np.ndarray] = []
 
+        missing = [name for name in cfg.input_cols + cfg.target_cols
+                   if name not in df.columns]
+        if missing:
+            raise ValueError(
+                f"The dataset has no {', '.join(missing)} column(s). A model is "
+                f"fitted to the columns named by input_cols and target_cols, so "
+                f"a dataset recorded before they were chosen has to be collected "
+                f"again."
+            )
+
         groups = df.groupby("episode_id")
         for episode_id, group in sorted(groups, key=lambda item: item[0]):
             if len(group) != cfg.seq_len:

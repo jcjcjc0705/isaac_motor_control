@@ -245,13 +245,16 @@ class DataCollectorNode(Node):
                 self.step_in_phase = 0
                 self.advance_episode()
 
-        # Command and state come from the same message, so one timestamp
-        # describes the whole row.
+        # effort_motor, the pose and the timestamp all come from the same
+        # message, so the row describes one instant. input_u is the command
+        # issued at that instant, which the joint will not feel for a few
+        # messages yet.
         self.rows.append([
             self.sim_time,
             self.global_step * self.cfg.dt,
             recorded_episode,
             self.u_cmd,
+            self.tracker.motor_effort,
             signal_type,
         ] + self.tracker.as_row())
 
@@ -269,7 +272,8 @@ class DataCollectorNode(Node):
         raise SystemExit
 
     ROW_COLUMNS = (
-        "time_actual", "time_ideal", "episode_id", "input_u", "signal_type",
+        "time_actual", "time_ideal", "episode_id",
+        "input_u", "effort_motor", "signal_type",
         "pos_motor", "vel_motor", "pos_joint1", "vel_joint1",
         "pos_joint2", "vel_joint2",
     )
@@ -286,7 +290,9 @@ class DataCollectorNode(Node):
         df["episode_id"] = df["episode_id"].astype(int)
 
         position_cols = [c for c in df.columns if c.startswith("pos_")]
-        state_cols = position_cols + [c for c in df.columns if c.startswith("vel_")]
+        state_cols = (position_cols
+                      + [c for c in df.columns if c.startswith("vel_")]
+                      + ["effort_motor"])
         # Non-finite rows are counted separately, since a comparison against
         # NaN is False and they never appear in the limit count.
         non_finite = ~df[state_cols].map(lambda v: pd.notna(v)).all(axis=1)
@@ -310,42 +316,46 @@ class DataCollectorNode(Node):
         delay = command_delay(df, self.cfg.dt)
         if delay == delay:
             print(f"  Command delay            : {delay:.2f} steps "
-                  f"({delay * self.cfg.dt * 1000:.0f} ms), compare against the "
-                  f"other dataset's")
+                  f"({delay * self.cfg.dt * 1000:.0f} ms) between input_u and "
+                  f"effort_motor")
         print("")
 
 
 def command_delay(df: pd.DataFrame, dt: float) -> float:
-    """Recorded steps of delay between a command and the response to it.
+    """Recorded steps between issuing a command and the joint receiving it.
 
-    The motor's acceleration is fitted to the command at the same step and at
-    the one before it; the share that lands on the earlier step is the delay.
-    It describes the session rather than the mechanism, because what sets it is
-    where the collector's publishing falls relative to the simulator's tick, so
-    it can differ between one run and the next.
+    ``input_u`` is what was published and ``effort_motor`` what the simulator
+    reports it applied, so sliding one against the other until they match reads
+    the latency off directly, with no model of the plant involved. The search
+    is over fractional steps because the round trip is quantised by the message
+    rate rather than by the recording rate.
 
-    Datasets meant to be used together -- a training set and the test set it is
-    scored against -- should report the same value. A model carries the delay
-    of the data it was fitted to, and reading it back on data with a different
-    one costs accuracy that looks like a worse model.
+    The latency is fixed within a collection and can differ between them, since
+    it depends on where the publishing falls relative to the simulator's tick.
+    That is why the model is fitted to effort_motor: a dataset carries its own
+    latency, and this number is what to compare when two of them are used
+    together.
     """
-    delays = []
+    if "effort_motor" not in df.columns:
+        return float("nan")
+    lags = np.arange(0.0, 8.01, 0.05)
+    measured = []
     for _, group in df.groupby("episode_id"):
         u = group["input_u"].to_numpy(dtype=float)
-        v = group["vel_motor"].to_numpy(dtype=float)
-        if len(u) < 4 or not (np.isfinite(u).all() and np.isfinite(v).all()):
+        applied = group["effort_motor"].to_numpy(dtype=float)
+        if len(u) < 16 or np.allclose(u, 0.0):
             continue
-        if np.allclose(u, 0.0):
+        if not (np.isfinite(u).all() and np.isfinite(applied).all()):
             continue
-        acceleration = np.diff(v) / dt
-        design = np.column_stack(
-            [u[1:], u[:-1], v[1:], np.ones(len(acceleration))]
-        )
-        coefficients, *_ = np.linalg.lstsq(design, acceleration, rcond=None)
-        weight = abs(coefficients[0]) + abs(coefficients[1])
-        if weight > 1e-12:
-            delays.append(abs(coefficients[1]) / weight)
-    return float(np.median(delays)) if delays else float("nan")
+        index = np.arange(len(u))
+        residuals = [
+            np.mean((applied - np.interp(index - lag, index, u)) ** 2)
+            for lag in lags
+        ]
+        measured.append(float(lags[int(np.argmin(residuals))]))
+        if len(measured) >= 10:
+            break
+    return float(np.median(measured)) if measured else float("nan")
 
 
 def prompt_mode() -> str:

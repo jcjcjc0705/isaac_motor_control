@@ -288,14 +288,30 @@ isaac_motor_control/
 | `time_ideal` | `global_step * dt`，理想時間軸 |
 | `episode_id` | 回合編號，從 0 起 |
 | `input_u` | 送出的力矩命令 |
+| `effort_motor` | 模擬器回報它實際施加在馬達上的力矩，模型的輸入 |
 | `signal_type` | 該回合的激勵訊號種類，訓練時用於分層切分 |
 | `pos_motor`, `vel_motor` | 馬達位置與速度 |
 | `pos_joint1`, `vel_joint1` | 第一連桿位置與速度 |
 | `pos_joint2`, `vel_joint2` | 第二連桿，僅在場景提供時才有 |
 
 每一筆 `/joint_states` 就是一個控制步，每 `record_decimation` 筆記錄一列，
-所以命令與狀態出自同一筆訊息，一列只需要一個時間戳，不需要內插對齊。
+所以狀態與 `effort_motor` 出自同一筆訊息，一列只需要一個時間戳。
 node 跟著模擬器的時鐘走，模擬器跑得慢只會花掉更多實際時間，不會少收資料。
+
+**模型的輸入是 `effort_motor` 而不是 `input_u`。** 命令送到 `/joint_command` 之後，
+要經過 DDS、Isaac 的 graph tick 與一個物理步才會真的作用在關節上。這個延遲在同一次
+收集內完全固定，但換一次收集就可能差一筆訊息，因為它取決於發布時機落在模擬器 tick
+的哪一側。用 `input_u` 當輸入的話，模型會把「那一次收集的延遲」學進權重裡，拿到延遲
+不同的資料上評分就會失準 —— 表現為測試分數莫名偏低，而模型其實沒有問題。
+`effort_motor` 是模擬器回報它當下施加了多少，跟它造成的狀態裝在同一筆訊息裡，
+兩者在定義上就對齊，與 session 無關。
+
+`input_u` 仍然會記錄，因為規劃器與安全判斷用的是你能控制的那個量。存檔時印出的
+`Command delay` 就是這兩欄對齊出來的延遲：
+
+```
+  Command delay            : 1.00 steps (50 ms) between input_u and effort_motor
+```
 
 位置在解析時就折疊到 ±π，因此控制器、統計與存檔看到的是同一個角度。
 

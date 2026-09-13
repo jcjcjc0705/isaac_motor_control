@@ -40,7 +40,12 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # CSV schema
     # ------------------------------------------------------------------
-    input_cols: Tuple[str, ...] = ("input_u",)
+    # The model is fitted to the effort the simulator reports it applied, not
+    # to the command that asked for it. The two differ by the latency of the
+    # round trip, which is fixed within one collection but can land a message
+    # or two apart between collections; effort_motor arrives in the same
+    # message as the response to it, so it carries no such offset.
+    input_cols: Tuple[str, ...] = ("effort_motor",)
     # Order matters: the first two targets belong to the motor stage, the last
     # two to the joint stage of CascadedSystem.
     target_cols: Tuple[str, ...] = ("pos_motor", "vel_motor", "pos_joint1", "vel_joint1")
@@ -56,7 +61,7 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     batch_size: int = 32
     learning_rate: float = 1e-3
-    epochs: int = 200
+    epochs: int = 400
     lr_decay_gamma: float = 0.99
     val_ratio: float = 0.2
     log_every: int = 10         # epochs between progress lines
