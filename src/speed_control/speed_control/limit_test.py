@@ -1,19 +1,13 @@
 """Measure the plant's effort-to-position gain from its equilibrium angles.
 
-A held effort settles at the angle where gravity balances it, so the gain is
-the slope of angle against effort. This node holds an effort until the joints
-stop, reads the angle, and repeats one step higher until a joint reaches
-``cfg.calib_limit``. Both joints are measured and the larger angle wins, since
-on a linkage the driven joint is not necessarily the one that swings furthest.
-
-Two gains come out of it: the equilibrium gain, and the peak gain that includes
-the overshoot on the way to equilibrium. ``effort_to_pos_gain`` wants the peak
-one, which is what the report prints.
+Holds an effort until the joints stop, reads the angle gravity balances it at,
+and repeats one step higher until a joint reaches ``cfg.calib_limit``. Both
+joints are measured and the larger angle wins. It reports an equilibrium gain
+and a peak gain; ``effort_to_pos_gain`` takes the peak one.
 
 Usage: collector mode 3, ``ros2 run speed_control data_collector``. Run it
 after any change to the mechanism and type its answer at the mode 1 or 2
-prompt, because the excitation amplitude is derived from the gain. Settings
-come from the calib_* block in config.py.
+prompt. Settings come from the calib_* block in config.py.
 """
 
 import math
@@ -22,6 +16,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
 from .config import DEFAULT_CONFIG
+from .actuator import actuator_efforts
 from .joint_state import JointStateTracker, build_command
 from .node_runner import run_node
 
@@ -37,6 +32,7 @@ class GainCalibrationNode(Node):
         self.create_subscription(JointState, "/joint_states", self.on_joint_states, 50)
         self.publisher = self.create_publisher(JointState, "/joint_command", 10)
 
+        self.last_stamp = None      # skips a tick that carried no new physics
         self.effort = cfg.calib_start_effort
         self.samples = []           # (effort, equilibrium angle, peak angle)
         self.phase = "RECOVER"
@@ -51,16 +47,14 @@ class GainCalibrationNode(Node):
         print("")
 
     def send_effort(self, effort: float) -> None:
-        self.publisher.publish(
-            build_command(self.get_clock().now().to_msg(), effort)
-        )
+        """Publish the held effort with each joint's friction added to it."""
+        self.publisher.publish(build_command(
+            self.get_clock().now().to_msg(),
+            actuator_efforts(self.tracker, self.cfg, effort),
+        ))
 
     def at_rest(self) -> bool:
-        """Moving slowly enough to call the current angle an equilibrium.
-
-        Velocity only, since a held effort settles away from zero and
-        :func:`is_settled` tests for a pose near zero.
-        """
+        """Moving slowly enough to call the current angle an equilibrium."""
         return (abs(self.tracker.motor_vel) < self.cfg.settled_vel_tol
                 and abs(self.tracker.joint1_vel) < self.cfg.settled_vel_tol)
 
@@ -75,6 +69,9 @@ class GainCalibrationNode(Node):
             raise SystemExit
 
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if stamp == self.last_stamp:    # a tick that carried no new physics
+            return
+        self.last_stamp = stamp
         if self.phase_t0 is None:
             self.phase_t0 = stamp
         elapsed = stamp - self.phase_t0
@@ -141,11 +138,6 @@ class GainCalibrationNode(Node):
         print(f"  effort_to_pos_gain : {peak_gain:.3f}")
         print("  Type this at the effort_to_pos_gain prompt in collector mode 1 "
               "or 2.")
-        print("  It is the peak gain, not the equilibrium one, because that is "
-              "what the")
-        print("  signal generators need: they ask how far a waveform throws a "
-              "joint, not")
-        print("  where it would come to rest.")
         print("")
 
         amplitude = (self.cfg.planner_safe_limit - self.cfg.planner_margin) / peak_gain
@@ -170,8 +162,7 @@ def _slope(x, y) -> float:
 def clamp(value: float, limit: float) -> float:
     """Clamp to +/-limit, mapping a non-finite value to zero.
 
-    ``min``/``max`` return the bound when handed a NaN, which would mean
-    answering a diverged simulator with a command at full effort.
+    ``min``/``max`` return the bound when handed a NaN, so it is tested for.
     """
     if not math.isfinite(value):
         return 0.0
@@ -185,12 +176,7 @@ def recovery_effort(tracker: JointStateTracker, cfg) -> float:
 
 
 def is_settled(tracker: JointStateTracker, cfg) -> bool:
-    """Both joints near zero and stopped.
-
-    joint1 counts as well as the motor, because training rolls every episode
-    out from a zero initial state and an episode that starts with the link
-    still swinging does not match that assumption.
-    """
+    """Both joints near zero and stopped."""
     return (abs(tracker.motor_pos) < cfg.settled_pos_tol
             and abs(tracker.motor_vel) < cfg.settled_vel_tol
             and abs(tracker.joint1_pos) < cfg.settled_pos_tol

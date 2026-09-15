@@ -8,12 +8,16 @@ def wrap_to_pi(angle: float) -> float:
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
 
-def build_command(stamp, effort: float) -> JointState:
-    """Effort command for the motor, as published on /joint_command."""
+def build_command(stamp, efforts) -> JointState:
+    """Effort command as published on /joint_command.
+
+    ``efforts`` maps joint name to torque. Every joint named here is driven by
+    the articulation controller.
+    """
     msg = JointState()
     msg.header.stamp = stamp
-    msg.name = ["motor"]
-    msg.effort = [float(effort)]
+    msg.name = list(efforts)
+    msg.effort = [float(efforts[name]) for name in msg.name]
     return msg
 
 
@@ -29,17 +33,16 @@ class JointStateTracker:
     same angle. ``has_joint2`` reports whether the scene published a second
     link, which is detected from the messages rather than configured.
 
-    ``motor_effort`` is the effort the simulator reports it applied, which
-    arrives in the same message as the pose it produced. A command published on
-    /joint_command reaches the joint some messages later, so the two are not
-    interchangeable: the command says what was asked for, this says what the
-    joint actually got.
+    ``motor_effort`` and ``joint1_effort`` are what the simulator reports it
+    applied, arriving in the same message as the pose they produced, which a
+    command published on /joint_command does not.
     """
 
     def __init__(self):
         self.motor_pos = 0.0
         self.motor_vel = 0.0
         self.motor_effort = 0.0
+        self.joint1_effort = 0.0
         self.joint1_pos = 0.0
         self.joint1_vel = 0.0
         self.joint2_pos = 0.0
@@ -60,6 +63,9 @@ class JointStateTracker:
             elif name in JOINT1_NAMES:
                 self.joint1_pos = wrap_to_pi(msg.position[index])
                 self.joint1_vel = msg.velocity[index]
+                self.joint1_effort = (
+                    msg.effort[index] if index < len(msg.effort) else 0.0
+                )
             elif name in JOINT2_NAMES:
                 self.joint2_pos = wrap_to_pi(msg.position[index])
                 self.joint2_vel = msg.velocity[index]
@@ -71,7 +77,8 @@ class JointStateTracker:
 
     def is_finite(self) -> bool:
         """False once the simulator has diverged and is publishing NaN."""
-        return all(math.isfinite(v) for v in self.as_row() + [self.motor_effort])
+        return all(math.isfinite(v)
+                   for v in self.as_row() + [self.motor_effort, self.joint1_effort])
 
     def max_abs_position(self) -> float:
         positions = [abs(self.motor_pos), abs(self.joint1_pos)]

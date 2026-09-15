@@ -1,17 +1,15 @@
 """Record the plant's response to designed excitation signals.
 
 Publishes effort commands on /joint_command, records /joint_states, and writes
-one CSV per session. Two layers keep the rig inside its travel limits: the
-signal generators shape every waveform to a predicted excursion, and this node
-hands the motor to a recovery controller if the rig approaches the limit
-anyway.
+one CSV per session. Each command carries the excitation plus the friction
+actuator.py computes for every joint. Two layers keep the rig inside its travel
+limits: the signal generators shape every waveform to a predicted excursion,
+and this node hands the motor to a recovery controller if the rig approaches
+the limit anyway.
 
-Every /joint_states message is one control step, so the node runs on the
-simulator's clock and the row count depends on messages received rather than
-seconds elapsed. A slow simulator therefore costs wall time, not data.
-
-Damping belongs to the scene, which applies it on the physics step; this node
-publishes only the excitation command.
+One distinct physics step is one control step, so the node runs on the
+simulator's clock and the row count depends on steps received rather than
+seconds elapsed.
 
 Usage:
 
@@ -35,6 +33,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
 from .config import DEFAULT_CONFIG
+from .actuator import actuator_efforts
 from .joint_state import JointStateTracker, build_command
 from .limit_test import GainCalibrationNode, clamp, is_settled, recovery_effort
 from .node_runner import run_node
@@ -76,6 +75,7 @@ class DataCollectorNode(Node):
         self.message_count = 0
         self.settling = True        # hold until the rig is at rest
         self.settle_t0 = None
+        self.last_stamp = None      # skips a tick that carried no new physics
         self.sim_time_0 = None
         self.u_cmd = 0.0            # excitation command, held between recorded steps
         self.sim_time = 0.0
@@ -100,9 +100,11 @@ class DataCollectorNode(Node):
     # ROS plumbing
     # ------------------------------------------------------------------
     def send_effort(self, effort: float) -> None:
-        self.publisher.publish(
-            build_command(self.get_clock().now().to_msg(), effort)
-        )
+        """Publish the excitation with each joint's friction added to it."""
+        self.publisher.publish(build_command(
+            self.get_clock().now().to_msg(),
+            actuator_efforts(self.tracker, self.cfg, effort),
+        ))
 
     def on_joint_states(self, msg: JointState) -> None:
         """One control step per message: the message stream is the node's clock."""
@@ -116,10 +118,15 @@ class DataCollectorNode(Node):
             raise SystemExit
 
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        # Only the first message of each physics step counts as a step; a graph
+        # tick faster than the physics rate repeats the previous one.
+        if stamp == self.last_stamp:
+            return
+        self.last_stamp = stamp
 
         if self.settling:
-            # Episode 0 starts from rest, because training rolls every episode
-            # out from a zero initial state.
+            # Episode 0 starts from rest, matching the zero initial state
+            # training rolls every episode out from.
             if self.settle_t0 is None:
                 self.settle_t0 = stamp
             self.send_effort(recovery_effort(self.tracker, self.cfg))
@@ -134,10 +141,11 @@ class DataCollectorNode(Node):
                       f"{self.tracker.motor_vel:+.3f} rad/s, "
                       f"joint1 {self.tracker.joint1_pos:+.3f} rad "
                       f"{self.tracker.joint1_vel:+.3f} rad/s.\n"
-                      f"The rig coasts to a stop on the damping that "
-                      f"isaac_scripts/actuator_model.py applies, so check that "
-                      f"the scene has it attached and is playing. Without it "
-                      f"nothing dissipates energy and the rig never settles.")
+                      f"The rig coasts to a stop on the friction actuator.py "
+                      f"applies, so raise b_viscous_motor or b_viscous_joint1 "
+                      f"if it will not settle. A rig that instead oscillates "
+                      f"without settling has coefficients too large for the "
+                      f"round trip, and they have to come down.")
                 self.send_effort(0.0)
                 raise SystemExit
             return
@@ -245,16 +253,16 @@ class DataCollectorNode(Node):
                 self.step_in_phase = 0
                 self.advance_episode()
 
-        # effort_motor, the pose and the timestamp all come from the same
-        # message, so the row describes one instant. input_u is the command
-        # issued at that instant, which the joint will not feel for a few
-        # messages yet.
+        # The efforts, the pose and the timestamp come from one message, so the
+        # row describes one instant. input_u is the excitation issued at that
+        # instant, which the joint feels one row later.
         self.rows.append([
             self.sim_time,
             self.global_step * self.cfg.dt,
             recorded_episode,
             self.u_cmd,
             self.tracker.motor_effort,
+            self.tracker.joint1_effort,
             signal_type,
         ] + self.tracker.as_row())
 
@@ -273,7 +281,7 @@ class DataCollectorNode(Node):
 
     ROW_COLUMNS = (
         "time_actual", "time_ideal", "episode_id",
-        "input_u", "effort_motor", "signal_type",
+        "input_u", "effort_motor", "effort_joint1", "signal_type",
         "pos_motor", "vel_motor", "pos_joint1", "vel_joint1",
         "pos_joint2", "vel_joint2",
     )
@@ -292,9 +300,9 @@ class DataCollectorNode(Node):
         position_cols = [c for c in df.columns if c.startswith("pos_")]
         state_cols = (position_cols
                       + [c for c in df.columns if c.startswith("vel_")]
-                      + ["effort_motor"])
-        # Non-finite rows are counted separately, since a comparison against
-        # NaN is False and they never appear in the limit count.
+                      + ["effort_motor", "effort_joint1"])
+        # Counted separately: a comparison against NaN is False, so non-finite
+        # rows never appear in the limit count.
         non_finite = ~df[state_cols].map(lambda v: pd.notna(v)).all(axis=1)
         exceeded = df[position_cols].abs().gt(self.cfg.hard_limit).any(axis=1)
         failed = df[exceeded]["episode_id"].unique()
@@ -324,17 +332,9 @@ class DataCollectorNode(Node):
 def command_delay(df: pd.DataFrame, dt: float) -> float:
     """Recorded steps between issuing a command and the joint receiving it.
 
-    ``input_u`` is what was published and ``effort_motor`` what the simulator
-    reports it applied, so sliding one against the other until they match reads
-    the latency off directly, with no model of the plant involved. The search
-    is over fractional steps because the round trip is quantised by the message
-    rate rather than by the recording rate.
-
-    The latency is fixed within a collection and can differ between them, since
-    it depends on where the publishing falls relative to the simulator's tick.
-    That is why the model is fitted to effort_motor: a dataset carries its own
-    latency, and this number is what to compare when two of them are used
-    together.
+    Slides ``input_u`` against ``effort_motor`` until they match. Expect one
+    step; a larger value means commands are queuing, and the fix is to set the
+    subscribe node's queueSize to 1 in the scene's graph.
     """
     if "effort_motor" not in df.columns:
         return float("nan")
@@ -371,8 +371,8 @@ def prompt_mode() -> str:
 def prompt_gain(cfg=DEFAULT_CONFIG) -> float:
     """Ask for effort_to_pos_gain, empty input keeping the configured value.
 
-    Asked before the node is built, because the signal generators size every
-    waveform against this gain as the schedule is laid out.
+    Asked before the node is built; the signal generators size every waveform
+    against this gain as the schedule is laid out.
     """
     print("")
     print("Enter the gain mode 3 measured on this mechanism, or press Enter for "

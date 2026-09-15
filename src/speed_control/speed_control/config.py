@@ -30,22 +30,26 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Episode layout, shared by collection and training
     # ------------------------------------------------------------------
-    episode_len: int = 200      # excitation steps per episode
-    reset_len: int = 100        # settling steps that drive the motor back to zero
+    # One recorded row is one physics step, one control period, and the dead
+    # time: a command issued at row k reaches the joint for the state recorded
+    # at row k+1. This requires the scene's graph to tick at twice the physics
+    # rate, 60 Hz over 30 Hz. Messages then arrive at the tick rate with every
+    # second one repeating a physics step, and the collector drops those.
+    episode_len: int = 300      # excitation steps per episode, 10 s
+    reset_len: int = 150        # settling steps, 5 s
     total_episodes: int = 500
-    dt: float = 0.05            # period of one recorded row, 20 Hz
-    record_decimation: int = 3  # /joint_states messages per recorded row
+    dt: float = 1.0 / 30.0      # period of one recorded row, 30 Hz
+    record_decimation: int = 1  # distinct physics steps per recorded row
     progress_every: int = 100   # recorded steps between collection progress lines
 
     # ------------------------------------------------------------------
     # CSV schema
     # ------------------------------------------------------------------
-    # The model is fitted to the effort the simulator reports it applied, not
-    # to the command that asked for it. The two differ by the latency of the
-    # round trip, which is fixed within one collection but can land a message
-    # or two apart between collections; effort_motor arrives in the same
-    # message as the response to it, so it carries no such offset.
-    input_cols: Tuple[str, ...] = ("effort_motor",)
+    # The model is fitted to the efforts the simulator reports it applied,
+    # which arrive in the same message as the response to them. Both joints
+    # appear as both are commanded, so the input is the whole torque the
+    # mechanism received and the plant learned is the undamped mechanism.
+    input_cols: Tuple[str, ...] = ("effort_motor", "effort_joint1")
     # Order matters: the first two targets belong to the motor stage, the last
     # two to the joint stage of CascadedSystem.
     target_cols: Tuple[str, ...] = ("pos_motor", "vel_motor", "pos_joint1", "vel_joint1")
@@ -108,39 +112,50 @@ class ExperimentConfig:
     planner_safe_limit: float = 1.2  # 69 deg, the angle signals are shaped to fit
     planner_margin: float = 0.05     # headroom kept below planner_safe_limit
     # Band on the planner's estimate of position plus lookahead velocity, the
-    # quantity the collector aborts on when it passes hard_limit. It sits below
-    # hard_limit because the estimate carries the same spread as the position
-    # one. Only fast waveforms are held back by it; a slow one is bounded by
-    # planner_safe_limit first.
+    # quantity the collector aborts on. Only fast waveforms are held back by
+    # it; a slow one is bounded by planner_safe_limit first.
     planner_lookahead_limit: float = 1.35
-    # Radians of excursion per unit of held effort, measured by collector mode
-    # 3. It describes the mechanism -- links, masses, friction -- so it has to
-    # be re-measured whenever any of those change, and it is what modes 1 and 2
-    # prompt for at startup. The value here is the default the prompt offers on
-    # Enter.
-    #
-    # Use the peak gain mode 3 reports rather than the equilibrium gain: the
-    # signal generators ask how far a waveform throws a joint, which includes
-    # the overshoot on the way to the equilibrium angle.
-    effort_to_pos_gain: float = 1.15
-    # Seconds. The plant reaches the angle above only if the effort stays put;
-    # a command that reverses sooner does not get that far. The peak predictor
-    # low-passes the command with this time constant before scaling it by the
-    # gain, which leaves a held effort at the full gain and attenuates a fast
-    # alternating one. Measured by comparing the prediction against the
-    # excursions a collected dataset actually reached.
+    # Radians of excursion per unit of held effort, from collector mode 3, and
+    # what modes 1 and 2 prompt for at startup. Re-measure after any change to
+    # the links, masses or friction. Use the peak gain mode 3 reports, not the
+    # equilibrium one.
+    effort_to_pos_gain: float = 1.013
+    # Seconds. The peak predictor low-passes the command with this time
+    # constant before scaling it by the gain. Calibrate it by comparing the
+    # predicted excursions against those a collected dataset reached.
     plant_time_constant: float = 0.3
     max_slew_rate: float = 500.0     # largest step-to-step change in the command
     lookahead: float = 0.2           # seconds of forward prediction before aborting
 
     # ------------------------------------------------------------------
+    # Actuator model (actuator.py), applied to every published command
+    # ------------------------------------------------------------------
+    # Friction the joints apply to themselves. The scene carries none of its
+    # own, so these are the whole of it; raise them to make a mechanism that
+    # will not settle settle.
+    #
+    # The ceiling is a property of the pair, not of either joint: doubling both
+    # makes the rig ring at half the physics step rate and never come to rest,
+    # while doubling either one alone does not. After changing them, or the
+    # physics step, kick the rig and check that the motion decays.
+    b_viscous_motor: float = 0.15     # N*m*s/rad
+    b_coulomb_motor: float = 0.0      # N*m, speed independent
+    b_viscous_joint1: float = 0.025
+    b_coulomb_joint1: float = 0.0
+    max_damping_torque: float = 2.0   # ceiling on either joint's friction
+    # Each joint's effective inertia, from the velocity one step of a known
+    # torque produces. The actuator model scales the viscous term with it; too
+    # small only makes the damping gentler, too large lets it ring.
+    inertia_motor: float = 0.022      # kg*m^2
+    inertia_joint1: float = 0.004
+
+    # ------------------------------------------------------------------
     # Recovery controller, used during the reset phase and after an abort
     # ------------------------------------------------------------------
-    # Both gains at zero means the recovery publishes no effort and lets the
-    # joints coast to a stop on their own friction, which is what a rig with dry
-    # friction does. Non-zero gains turn the reset into a PD loop closed through
-    # the round trip to the simulator, so raise them only if the mechanism will
-    # not settle on its own, and expect to re-tune them per mechanism.
+    # Both gains at zero means the recovery publishes no excitation and lets
+    # the actuator model's friction stop the joints. Non-zero gains close a PD
+    # loop through the round trip to the simulator and have to be re-tuned per
+    # mechanism.
     reset_kp: float = 0.0
     reset_kd: float = 0.0
     max_effort: float = 2.5         # ceiling on any effort the nodes publish
@@ -196,10 +211,7 @@ class ExperimentConfig:
         """The effort that fills the safe band when simply held, in effort units.
 
         Only the slowest waveforms are scaled to about this much; a fast one is
-        given more, since it reverses before the joint has travelled that far.
-        It is the reference the startup report prints, and it follows
-        effort_to_pos_gain, which is why entering a freshly measured gain is
-        enough to fit a collection to a new mechanism.
+        given more. It is the reference the startup report prints.
         """
         return self.safe_travel / self.effort_to_pos_gain
 

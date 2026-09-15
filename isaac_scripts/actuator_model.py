@@ -2,7 +2,22 @@
 #  Actuator model script
 #
 #  Gives a joint the damping a real actuator has, computed inside the simulator
-#  and applied every physics step.
+#  and applied before every physics step, from the velocity that step is about
+#  to integrate.
+#
+#  This is the alternative to speed_control/actuator.py, which does the same
+#  from the ROS side. Exactly one of them may be active: with both, every joint
+#  gets its friction twice. Inside is worth choosing when the graph ticks at
+#  the physics rate, since the torque then reaches the joint a step sooner than
+#  a reply sent over ROS can; outside is worth choosing while the model is
+#  still being changed, since it needs no round trip through the Script Editor.
+#
+#  The coefficients are bounded by the physics step: too large for the step
+#  and the rig rings at half the step rate and never settles. Passing an
+#  inertia scales the viscous term the way an implicit step would, which lifts
+#  that ceiling. The ceiling belongs to the pair rather than to either joint --
+#  doubling both rings, doubling either one alone does not. After changing the
+#  coefficients or the step, kick the rig and check that the motion decays.
 #
 #  How to use:
 #    1. Open Window > Visual Scripting > Action Graph and load /World/ActionGraph
@@ -46,7 +61,8 @@ SCRIPT_NODE_TYPE = "omni.graph.scriptnode.ScriptNode"
 _JOINTS = []
 
 
-def apply_actuator(joint_path, b_viscous=None, b_coulomb=None, max_torque=None):
+def apply_actuator(joint_path, b_viscous=None, b_coulomb=None, max_torque=None,
+                   inertia=None):
     """Register one joint. Nothing reaches the stage until install() runs."""
     stage = omni.usd.get_context().get_stage()
     prim = stage.GetPrimAtPath(joint_path)
@@ -68,6 +84,9 @@ def apply_actuator(joint_path, b_viscous=None, b_coulomb=None, max_torque=None):
     if max_torque is not None:
         entry["max_torque"] = float(max_torque)
         done.append(f"torque ceiling = {float(max_torque)} N*m")
+    if inertia is not None:
+        entry["inertia"] = float(inertia)
+        done.append(f"effective inertia = {float(inertia)} kg*m^2")
     if len(entry) == 1:
         print(f"[WARN] {joint_path} given no coefficients, skipping")
         return
@@ -92,11 +111,10 @@ def apply_actuator(joint_path, b_viscous=None, b_coulomb=None, max_torque=None):
 
 
 # The engine, as it will live inside the USD. It imports nothing from this
-# repository, because once written to the stage the USD holds the only copy, and
-# it resolves each joint's axis and bodies from the stage at run time, so
-# nothing about the mechanism is baked into the text.
+# repository and resolves each joint's axis and bodies from the stage at run
+# time, so nothing about the mechanism is baked into the text.
 _ENGINE = '''\
-"""Actuator model: joint damping applied on the physics step.
+"""Actuator model: joint damping applied before each physics step.
 
 This code and the JOINTS table below were written into the stage by
 isaac_scripts/actuator_model.py. Make changes by editing that script and
@@ -232,7 +250,16 @@ def setup(db):
 
     _state.update(art=art, bodies=bodies, plan=plan, paths=body_paths,
                   n=len(body_paths), warned=False)
-    _state["sub"] = omni.physx.get_physx_interface().subscribe_physics_step_events(_on_step)
+    physx = omni.physx.get_physx_interface()
+    # Before the step, not after: the torque is computed from the velocity the
+    # step is about to integrate, so it lands in that step rather than the next
+    # one. The plain subscription is the fallback where the ordered form is
+    # missing, and costs one step of lag.
+    try:
+        _state["sub"] = physx.subscribe_physics_on_step_events(_on_step, pre_step=True, order=0)
+    except (AttributeError, TypeError):
+        _state["sub"] = physx.subscribe_physics_step_events(_on_step)
+        print("[actuator] no pre-step subscription on this build, damping lags one step")
     for e in plan:
         print("[actuator] %s -> DOF %d, axis %s, viscous %s, coulomb %s, max %s"
               % (e["joint"], e["dof"], e["axis"], e.get("b_viscous", 0.0),
@@ -278,7 +305,14 @@ def _on_step(dt):
         if i >= len(vel):
             continue
         w = vel[i]
-        tau = -entry.get("b_viscous", 0.0) * w
+        viscous = entry.get("b_viscous", 0.0)
+        inertia = entry.get("inertia", 0.0)
+        if inertia > 0.0:
+            # What an implicit step of the same decay would have applied. The
+            # explicit form overshoots once the coefficient is large for the
+            # step and feeds the joint energy instead of draining it.
+            viscous = viscous / (1.0 + viscous * dt / inertia)
+        tau = -viscous * w
         coulomb = entry.get("b_coulomb", 0.0)
         if coulomb and abs(w) > 1e-6:
             tau -= coulomb * (1.0 if w > 0.0 else -1.0)
@@ -373,18 +407,20 @@ def install(script_node_path):
 # -------------------------------- Joint 1 ------------------------------------
 apply_actuator(
     joint_path = "/World/Cylinder/motor",   # right-click -> Copy Prim Path
-    b_viscous  = 0.3,                       # viscous damping (N*m*s/rad)
+    b_viscous  = 0.15,                      # viscous damping (N*m*s/rad)
     b_coulomb  = 0.0,                       # dry friction, speed independent (N*m)
     max_torque = 2.0,                       # ceiling on this joint's torque (N*m)
+    inertia    = 0.022,                     # effective inertia (kg*m^2)
 )
 
 
 # -------------------------------- Joint 2 ------------------------------------
 apply_actuator(
     joint_path = "/World/Cube_02/joint1",   # the passive link's hinge
-    b_viscous  = 0.05,
+    b_viscous  = 0.025,
     b_coulomb  = 0.0,
     max_torque = 2.0,
+    inertia    = 0.004,
 )
 
 
@@ -394,9 +430,10 @@ apply_actuator(
 #
 # apply_actuator(
 #     joint_path = "/World/Cube_03/joint2",
-#     b_viscous  = 0.05,
+#     b_viscous  = 0.025,
 #     b_coulomb  = 0.01,
 #     max_torque = 2.0,
+#     inertia    = 0.004,
 # )
 
 
