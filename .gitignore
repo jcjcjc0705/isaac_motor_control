@@ -15,6 +15,7 @@ models/
 runs/
 plots/
 scalers/
+results/
 
 # Isaac Sim generated thumbnails
 .thumbs/
