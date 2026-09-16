@@ -20,12 +20,12 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Paths
     # ------------------------------------------------------------------
-    data_file: str = "data/train.csv"
-    test_file: str = "data/test.csv"
-    data_dir: str = "data"
-    model_dir: str = "models"
-    scaler_dir: str = "scalers"
-    plot_dir: str = "plots"
+    # Every output of a run -- datasets, checkpoint, scaler, plots and
+    # TensorBoard logs -- is written under results_root/experiment. Give each
+    # configuration its own experiment name and nothing a previous run wrote is
+    # overwritten. The directories below are derived from it.
+    experiment: str = "60-60-queue1"
+    results_root: str = "results"
 
     # ------------------------------------------------------------------
     # Episode layout, shared by collection and training
@@ -234,6 +234,39 @@ class ExperimentConfig:
     @property
     def output_dim(self) -> int:
         return len(self.target_cols)
+
+    @property
+    def experiment_dir(self) -> str:
+        """Directory holding everything this configuration produces."""
+        return os.path.join(self.results_root, self.experiment)
+
+    @property
+    def data_dir(self) -> str:
+        return os.path.join(self.experiment_dir, "data")
+
+    @property
+    def model_dir(self) -> str:
+        return os.path.join(self.experiment_dir, "models")
+
+    @property
+    def scaler_dir(self) -> str:
+        return os.path.join(self.experiment_dir, "scalers")
+
+    @property
+    def plot_dir(self) -> str:
+        return os.path.join(self.experiment_dir, "plots")
+
+    @property
+    def tensorboard_dir(self) -> str:
+        return os.path.join(self.experiment_dir, "runs")
+
+    @property
+    def data_file(self) -> str:
+        return os.path.join(self.data_dir, "train.csv")
+
+    @property
+    def test_file(self) -> str:
+        return os.path.join(self.data_dir, "test.csv")
 
     @property
     def dataset_name(self) -> str:
