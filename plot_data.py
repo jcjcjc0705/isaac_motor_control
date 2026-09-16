@@ -86,6 +86,16 @@ def report_limits(df: pd.DataFrame, config):
     return failed, has_joint2
 
 
+def excitation_end(input_u) -> int:
+    """Index where the excitation stops and the reset phase begins.
+
+    Reads the boundary off the command column, so it holds for an episode of
+    any length. Returns 0 when the episode carries no excitation.
+    """
+    nonzero = [i for i, value in enumerate(input_u) if value != 0.0]
+    return nonzero[-1] + 1 if nonzero else 0
+
+
 def plot_dataset(df: pd.DataFrame, config, failed_episodes, has_joint2, csv_path: str) -> str:
     time_col = "time_actual"
     name = os.path.basename(csv_path)
@@ -110,7 +120,8 @@ def plot_dataset(df: pd.DataFrame, config, failed_episodes, has_joint2, csv_path
     if has_joint2:
         ax_velocity.plot(episode_time, episode["vel_joint2"].to_numpy(), "m-", alpha=0.8, label="Joint2 vel")
 
-    reset_index = min(config.episode_len - 1, len(episode) - 1)
+    reset_index = min(excitation_end(episode["input_u"].to_numpy()),
+                      len(episode) - 1)
     if reset_index > 0:
         ax_velocity.axvline(x=episode_time[reset_index], color="orange",
                             linestyle=":", label="Reset phase start")

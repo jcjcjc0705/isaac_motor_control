@@ -125,7 +125,7 @@ src/speed_control/speed_control/config.py
 | CSV 欄位 | `input_cols`, `target_cols` | 模型輸入是兩個關節實際施加的 effort |
 | 模型 | `state_dim`, `history_window` | 狀態階數與堆疊的歷史命令步數 |
 | 訓練 | `batch_size`, `learning_rate`, `epochs`, `val_ratio`, `seed`, `deterministic` | |
-| 激勵訊號 | `signal_mix`, `signal_ranges` | 振幅不是設定值，由規劃器依預測擺幅推算 |
+| 激勵訊號 | `signal_mix`, `signal_ranges`, `fade_in_steps` | 振幅不是設定值，由規劃器依預測擺幅推算 |
 | 安全極限 | `hard_limit`, `abort_limit`, `planner_safe_limit`, `planner_lookahead_limit` | 見「安全機制」 |
 | 機構增益 | `effort_to_pos_gain`, `plant_time_constant` | 決定規劃器的預測 |
 | **致動器模型** | `b_viscous_*`, `b_coulomb_*`, `inertia_*`, `max_damping_torque` | 見「致動器模型」 |
@@ -277,7 +277,7 @@ Script Node，以 body torque 施力。兩者**只能擇一啟用**，同時啟�
 | `time_actual` | 模擬器時鐘，從收集開始起算的秒數 |
 | `time_ideal` | `global_step * dt`，理想時間軸 |
 | `episode_id` | 回合編號，從 0 起 |
-| `input_u` | 送出的激勵力矩（不含摩擦） |
+| `input_u` | 送出的激勵力矩，已乘上淡入窗，不含摩擦；歸零控制器接管期間為 0 |
 | `effort_motor` | 模擬器回報實際施加在馬達上的力矩，模型輸入 |
 | `effort_joint1` | 同上，連桿鉸鏈，模型輸入 |
 | `signal_type` | 該回合的激勵訊號種類，訓練時用於分層切分 |
@@ -332,6 +332,24 @@ x_{t+1} = (1 - a) x_t + a f(x_t, u_t)
 4. **`hard_limit`** —— 機構行程極限，用於事後統計。存檔時會報告有多少列、
    哪些回合曾經超過，以及是否出現非有限值。
 
+### 激勵的淡入
+
+波形不會從靜止直接跳到它的振幅。送出的命令會乘上一個長度為 `fade_in_steps`
+的升餘弦窗，權重與斜率都由 0 起算：
+
+```
+w(i) = 0.5 × (1 − cos(π i / fade_in_steps))     i < fade_in_steps
+w(i) = 1                                        i >= fade_in_steps
+```
+
+窗在兩個時機重新開始：每個回合的激勵段開頭，以及歸零控制器把致動器交還的那一步。
+第二個時機同樣必要 —— 中止後波形會從它當下的相位接回，該處的振幅通常不是零。
+
+`fade_in_steps` 要取得比物理步能承載的最高頻率的週期長數倍。太短則一步之內的
+力矩變化足以把關節推上前瞻門檻，該回合會立刻被中止層接管；設為 0 則關閉淡入。
+
+淡入只作用在激勵起步與接回處，不影響回合中段，方波類訊號的銳利反轉會原樣送出。
+
 ### 擺幅怎麼預測
 
 把命令先用 `plant_time_constant` 做一階低通再取峰值：
@@ -348,9 +366,13 @@ x_{t+1} = (1 - a) x_t + a f(x_t, u_t)
 `plant_time_constant` 的校法是拿一份收好的資料，比較預測擺幅與實際擺幅，
 取比值中位數為 1 的那個 tau。
 
-預測有散度，安全帶與中止門檻之間的差距是留給它的。MULTISINE 最容易低估，
-實測會偶爾踩到中止層、截掉激勵段最後幾步；要完全避免就把 `planner_safe_limit`
-調低。
+預測有散度，安全帶與中止門檻之間的差距是留給它的。
+
+中止層用的是線性外推（`位置 + lookahead × 速度`），對會提早反轉的訊號偏保守。
+PRBS 的方波反轉最容易踩到它：關節的瞬時速度足以讓外推越界，但阻尼與下一次反轉
+會在 `lookahead` 秒之前就把它停住，實際位置離 `abort_limit` 還很遠。代價是該
+回合剩餘的激勵被歸零控制器接管。要收回這部分，把中止層的前瞻改成與規劃器相同的
+低通預測；要更保守，則調低 `planner_safe_limit`。
 
 ## 激勵的頻率覆蓋
 

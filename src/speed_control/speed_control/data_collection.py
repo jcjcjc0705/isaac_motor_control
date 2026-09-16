@@ -37,7 +37,8 @@ from .actuator import actuator_efforts
 from .joint_state import JointStateTracker, build_command
 from .limit_test import GainCalibrationNode, clamp, is_settled, recovery_effort
 from .node_runner import run_node
-from .signals import build_test_schedule, build_training_schedule, render_signal, seed_everything
+from .signals import (build_test_schedule, build_training_schedule,
+                      fade_weight, render_signal, seed_everything)
 
 TRAIN_MODE = "train"
 TEST_MODE = "test"
@@ -68,6 +69,7 @@ class DataCollectorNode(Node):
         self.tracker = JointStateTracker()
         self.phase = "EXCITE"
         self.is_recovering = False
+        self.fade_step = 0          # position in the raised-cosine fade window
         self.episode_index = 0
         self.step_in_phase = 0
         self.global_step = 0
@@ -90,8 +92,8 @@ class DataCollectorNode(Node):
         print(f"Episodes: {len(self.schedule)} x "
               f"({self.cfg.episode_len} excite + {self.cfg.reset_len} reset) steps")
         print(f"effort_to_pos_gain: {self.cfg.effort_to_pos_gain}")
-        print(f"Control: every /joint_states message, 1 row per "
-              f"{self.cfg.record_decimation} messages")
+        print(f"Control: one step per distinct physics step, 1 row per "
+              f"{self.cfg.record_decimation} steps")
         # Absolute path, since config holds it relative to the working directory
         # and the node can be launched from anywhere.
         print(f"Output: {os.path.abspath(self.output_path)}")
@@ -180,14 +182,23 @@ class DataCollectorNode(Node):
 
         Returns the command that the motor model will act on, or NaN to mean
         "recovery owns the actuator this step" so the caller bypasses the model.
+
+        The waveform is eased in over ``cfg.fade_in_steps`` from the start of
+        the episode and again from the moment recovery hands the actuator back,
+        so the drive is never stepped from rest.
         """
         if not self.is_recovering and self.should_abort():
             self.is_recovering = True
+            self.fade_step = 0
 
         if not self.is_recovering:
             if self.step_in_phase < len(self.current_signal):
-                return float(self.current_signal[self.step_in_phase])
-            return 0.0
+                value = float(self.current_signal[self.step_in_phase])
+            else:
+                value = 0.0
+            value *= fade_weight(self.fade_step, self.cfg.fade_in_steps)
+            self.fade_step += 1
+            return value
 
         if is_settled(self.tracker, self.cfg):
             self.is_recovering = False
@@ -251,6 +262,7 @@ class DataCollectorNode(Node):
             if self.step_in_phase >= self.cfg.reset_len:
                 self.phase = "EXCITE"
                 self.step_in_phase = 0
+                self.fade_step = 0
                 self.advance_episode()
 
         # The efforts, the pose and the timestamp come from one message, so the

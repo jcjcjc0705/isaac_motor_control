@@ -111,6 +111,21 @@ def fit_to_travel(u: np.ndarray, cfg: ExperimentConfig, travel_fraction: float) 
     return np.clip(u * scale, -cfg.max_effort, cfg.max_effort)
 
 
+def fade_weight(index: int, steps: int) -> float:
+    """Raised-cosine weight that eases an excitation in from rest.
+
+    Returns 0 at ``index`` 0 and 1 from ``index`` ``steps`` onward. The weight
+    and its slope both start at zero, so a command that begins or resumes
+    part-way through a waveform carries no step discontinuity. Pass ``steps``
+    as 0 to disable the fade.
+    """
+    if steps <= 0 or index >= steps:
+        return 1.0
+    if index <= 0:
+        return 0.0
+    return 0.5 * (1.0 - math.cos(math.pi * index / steps))
+
+
 def limit_slew_rate(signal: np.ndarray, max_step: float) -> np.ndarray:
     """Clamp the step-to-step change so the drive never sees a jump discontinuity."""
     smoothed = np.zeros_like(signal)

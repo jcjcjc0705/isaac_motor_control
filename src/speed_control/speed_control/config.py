@@ -101,7 +101,7 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     test_episodes: int = 10
     test_episode_len: int = 1000
-    test_reset_len: int = 100
+    test_reset_len: int = 150
     test_signal_type: str = "SMOOTH_NOISE"
 
     # ------------------------------------------------------------------
@@ -126,6 +126,11 @@ class ExperimentConfig:
     plant_time_constant: float = 0.3
     max_slew_rate: float = 500.0     # largest step-to-step change in the command
     lookahead: float = 0.2           # seconds of forward prediction before aborting
+    # Steps over which the excitation is eased in from zero by a raised-cosine
+    # window, applied at the start of every episode and whenever the recovery
+    # controller hands the actuator back. Keep the window several times longer
+    # than one period of the highest frequency the physics step can carry.
+    fade_in_steps: int = 12          # 0.4 s at 30 Hz; 0 disables the fade
 
     # ------------------------------------------------------------------
     # Actuator model (actuator.py), applied to every published command
@@ -182,8 +187,8 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     viz_train_episodes: Tuple[int, ...] = (10, 100, 250, 400)
     viz_include_test: bool = True
-    viz_test_start: int = 8800          # first row sliced out of the test CSV
-    viz_test_len: Optional[int] = 1100  # None means "to the end of the file"
+    viz_test_start: int = 9200          # first row sliced out of the test CSV
+    viz_test_len: Optional[int] = 1150  # None means "to the end of the file"
     viz_channels: Tuple[int, ...] = (0, 1, 2, 3)  # which target_cols to plot
 
     # ------------------------------------------------------------------
