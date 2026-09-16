@@ -133,8 +133,15 @@ class ExperimentConfig:
     fade_in_steps: int = 24          # 0.4 s at 60 Hz; 0 disables the fade
 
     # ------------------------------------------------------------------
-    # Actuator model (actuator.py), applied to every published command
+    # Actuator model, applied to every published command
     # ------------------------------------------------------------------
+    # Where the friction is computed. True leaves it to the Script Node built
+    # by isaac_scripts/actuator_model.py, and the published command then
+    # carries the excitation alone. False computes it here, in actuator.py.
+    # Exactly one of the two may be active: with both, every joint gets its
+    # friction twice. The coefficients below describe the model either way, and
+    # the Script Node must be given the same numbers.
+    actuator_in_simulator: bool = True
     # Friction the joints apply to themselves. The scene carries none of its
     # own, so these are the whole of it; raise them to make a mechanism that
     # will not settle settle.

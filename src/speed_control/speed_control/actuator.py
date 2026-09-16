@@ -7,6 +7,9 @@ Both joints are commanded. No excitation is sent to the link's hinge, but its
 friction reaches it through the same channel, since /joint_command is the only
 way in.
 
+Setting ``cfg.actuator_in_simulator`` publishes the excitation alone and leaves
+the friction to the Script Node built by isaac_scripts/actuator_model.py.
+
 Coefficients live in config.py and are bounded by the physics step: raising
 them past what the step supports makes the rig ring at half the step rate and
 never settle. After changing either the coefficients or the step, kick the rig
@@ -37,7 +40,13 @@ def damping_torque(velocity: float, viscous: float, coulomb: float,
 
 
 def actuator_efforts(tracker, cfg, excitation: float) -> dict:
-    """Effort to publish for every joint: excitation plus that joint's friction."""
+    """Effort to publish for every joint: excitation plus that joint's friction.
+
+    With ``cfg.actuator_in_simulator`` the friction is left to the simulator and
+    only the excitation is published.
+    """
+    if cfg.actuator_in_simulator:
+        return {"motor": excitation, "joint1": 0.0}
     return {
         "motor": excitation + damping_torque(
             tracker.motor_vel, cfg.b_viscous_motor, cfg.b_coulomb_motor,
