@@ -17,16 +17,16 @@ Isaac Sim (isaac_motor_usd/*.usd)   無阻尼剛體，物理步 30 Hz、graph ti
 speed_control/actuator.py       每個關節的摩擦
 speed_control/data_collection.py  激勵訊號、安全保護、錄製
         |
-        v  data/train.csv, data/test.csv
+        v  results/<experiment>/data/train.csv, test.csv
 plot_data.py        檢查資料品質與是否撞到行程極限
         |
         v
 train.py            訓練串聯式 NSSM
         |
-        v  models/*.pth, scalers/*.json, runs/ (TensorBoard)
+        v  results/<experiment>/models/*.pth, scalers/*.json, runs/ (TensorBoard)
 visualize_model.py  開迴路預測並與真值比對
         |
-        v  plots/pred_*.png
+        v  results/<experiment>/plots/pred_*.png
 ```
 
 ## 環境需求
@@ -69,7 +69,7 @@ pip install -r requirements.txt
 source ROS。`source setup.bash` 會把 ROS 的 site-packages 加進 `PYTHONPATH`，
 而 conda 的 Python 會照單全收，混在一起容易出現難查的衝突。
 
-兩邊透過 `data/` 目錄的 CSV 交換資料。**所有指令都從 repo 根目錄執行**，因為
+兩邊透過 `cfg.data_dir` 內的 CSV 交換資料。**所有指令都從 repo 根目錄執行**，因為
 config 中的路徑是相對路徑。各腳本啟動時都會印出實際使用的絕對路徑。
 
 TensorBoard 為選用；未安裝時訓練仍可進行，只是不會記錄 scalar。
@@ -120,7 +120,7 @@ src/speed_control/speed_control/config.py
 
 | 分組 | 代表參數 | 說明 |
 |---|---|---|
-| 路徑 | `data_file`, `test_file`, `model_dir` | 模型與 scaler 檔名由 `data_file` 自動推導 |
+| 路徑 | `experiment`, `results_root` | 一輪的所有輸出都落在 `results/<experiment>/`，其餘路徑由它推導 |
 | 回合結構 | `episode_len`, `reset_len`, `total_episodes`, `dt`, `record_decimation` | 一列 = 一個物理步 = 一個控制週期 |
 | CSV 欄位 | `input_cols`, `target_cols` | 模型輸入是兩個關節實際施加的 effort |
 | 模型 | `state_dim`, `history_window` | 狀態階數與堆疊的歷史命令步數 |
@@ -203,17 +203,17 @@ ros2 run speed_control data_collector     # 選 1 收訓練資料，選 2 收測
 python3 plot_data.py
 ```
 
-把 `data/` 內每一份 CSV 都讀過一次，各自輸出超限統計與 `data/<檔名>_analysis.png`。
+把 `cfg.data_dir` 內每一份 CSV 都讀過一次，各自輸出超限統計與 `<檔名>_analysis.png`。
 讀不動、沒有資料列、或缺少必要欄位的檔案會印出原因並跳過。
 
 ### 6. 訓練
 
 ```bash
 python3 train.py
-tensorboard --logdir runs
+tensorboard --logdir results/<experiment>/runs
 ```
 
-輸出最佳模型到 `models/`、scaler 到 `scalers/`、TensorBoard log 到 `runs/`。
+輸出最佳模型、scaler 與 TensorBoard log，全部落在 `results/<experiment>/` 之下。
 
 ### 7. 檢視預測結果
 
@@ -222,7 +222,7 @@ python3 visualize_model.py
 ```
 
 對 `viz_train_episodes` 指定的訓練回合與 `test_file` 的指定切片做整段開迴路預測
-（初始狀態為零，只餵命令序列），輸出到 `plots/pred_*.png`。
+（初始狀態為零，只餵命令序列），輸出到 `results/<experiment>/plots/pred_*.png`。
 
 ## 目錄結構
 
@@ -235,6 +235,7 @@ isaac_motor_control/
 ├── visualize_model.py             開迴路預測與繪圖
 ├── plot_data.py                   資料品質檢查
 ├── isaac_motor_usd/               Isaac Sim 場景
+├── results/<experiment>/          該輪的資料、模型、scaler、圖與 TensorBoard log
 ├── isaac_scripts/
 │   └── actuator_model.py          致動器模型的模擬器內版本（替代方案）
 └── src/speed_control/speed_control/
@@ -398,8 +399,10 @@ PRBS 的方波反轉最容易踩到它：關節的瞬時速度足以讓外推越
   存檔時也會單獨報告非有限值的列數。
 - **控制迴路一律掛在訊息流上，不要掛在計時器上。** 即時率不為 1 時，以牆上時鐘
   計時的迴路會與模擬時間脫節。
-- **`data/`、`models/`、`runs/`、`plots/`、`scalers/` 都在 .gitignore 內**，
-  跨機器搬移時需另外複製，且 `scalers/*.json` 與 `models/*.pth` 必須成對使用。
+- **`results/` 在 .gitignore 內**，跨機器搬移時需另外複製，且同一輪的
+  `scalers/*.json` 與 `models/*.pth` 必須成對使用。
+- **每一輪換一個 `experiment` 名稱。** 收資料、訓練與畫圖都只寫入
+  `results/<experiment>/`，改名之前的輸出不會被覆蓋。
 - **`scipy.interpolate.interp1d` 在新版 SciPy 中標記為 legacy**，未來若被移除，
   三次樣條可換成 `scipy.interpolate.CubicSpline`。使用處為 `signals.py` 的
   SMOOTH_NOISE 產生器。
