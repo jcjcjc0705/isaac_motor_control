@@ -11,7 +11,7 @@
 ## 流程總覽
 
 ```
-Isaac Sim (isaac_motor_usd/*.usd)   無阻尼剛體，物理步 30 Hz、graph tick 60 Hz
+Isaac Sim (isaac_motor_usd/*.usd)   無阻尼剛體，物理步 60 Hz、graph tick 60 Hz
         |  ROS 2: /joint_command 送兩個關節的 effort，/joint_states 回傳狀態
         v
 speed_control/actuator.py       每個關節的摩擦
@@ -81,27 +81,31 @@ TensorBoard 為選用；未安裝時訓練仍可進行，只是不會記錄 scal
 | 節點 | 設定 |
 |---|---|
 | `OnPlaybackTick` | 驅動下面兩個分支 |
-| `ROS2SubscribeJointState` | **`queueSize` 設為 1** |
+| `ROS2SubscribeJointState` | **`queueSize` 設為 10** |
 | `IsaacArticulationController` | `targetPrim` 指向帶 `ArticulationRootAPI` 的 prim |
 | `ROS2PublishJointState` | 時戳接 `IsaacReadSimulationTime` |
 
 場景另外需要：
 
 - 每個關節的 `drive:angular:physics:damping` 與 `physxJoint:jointFriction` 都設為 **0**
-- **物理步 30 Hz**（Window → Physics Stage Settings 的 Time Steps Per Second）
+- **物理步 60 Hz**（Window → Physics Stage Settings 的 Time Steps Per Second）
 - **`timeCodesPerSecond` 60**（stage 的 layer metadata）
 
 ### 頻率的關係
 
 ```
-物理步 30 Hz ─┬─ graph tick 60 Hz ─→ 訊息 60 Hz（一半是重複的狀態，收集器會過濾）
+物理步 60 Hz ─┬─ graph tick 60 Hz ─→ 訊息 60 Hz（每則都帶新的物理步）
               │                        ↓
-              │                     有效狀態 30 Hz ─→ 控制週期 30 Hz，dt = 1/30
-              └─ 死時間 = 1 個物理步 = 33.3 ms = 1 個控制週期
+              │                     有效狀態 60 Hz ─→ 控制週期 60 Hz，dt = 1/60
+              └─ 死時間：依訂閱佇列深度而定，存檔時由 Command delay 報告
 ```
 
-**graph tick 必須是物理步的兩倍。** 一比一時死時間會變成兩個物理步；
-`record_decimation` 與 `dt` 也是依此設定的，改動任一項時三者要一起調整。
+graph tick 與物理步為一比一，訊息裡沒有重複的狀態，收集器的去重過濾不會作用。
+`dt` 與 `record_decimation` 依此設定，改動任一項時三者要一起調整。
+
+命令的死時間取決於 `ROS2SubscribeJointState` 的 `queueSize`。佇列較深時，
+發布端累積的命令會排隊等待，關節收到的是較早送出的那一個，死時間隨佇列長度增加；
+`queueSize` 為 1 時只保留最新的命令。存檔時報告的 Command delay 就是實測值。
 
 手動建立 PhysicsScene 時**務必明確設定重力**（`gravityMagnitude` 9.81、
 `gravityDirection` (0,0,-1)）。stage 沒有寫 `metersPerUnit`，預設會把重力換算成

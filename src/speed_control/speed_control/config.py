@@ -30,17 +30,17 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Episode layout, shared by collection and training
     # ------------------------------------------------------------------
-    # One recorded row is one physics step, one control period, and the dead
-    # time: a command issued at row k reaches the joint for the state recorded
-    # at row k+1. This requires the scene's graph to tick at twice the physics
-    # rate, 60 Hz over 30 Hz. Messages then arrive at the tick rate with every
-    # second one repeating a physics step, and the collector drops those.
-    episode_len: int = 300      # excitation steps per episode, 10 s
-    reset_len: int = 150        # settling steps, 5 s
+    # One recorded row is one physics step and one control period. The scene's
+    # graph ticks once per physics step, 60 Hz over 60 Hz, so every message
+    # carries a new state. The dead time between a command and the state that
+    # answers it follows the subscriber queue depth set in the scene, and is
+    # reported as "Command delay" when a collection is saved.
+    episode_len: int = 600      # excitation steps per episode, 10 s
+    reset_len: int = 300        # settling steps, 5 s
     total_episodes: int = 500
-    dt: float = 1.0 / 30.0      # period of one recorded row, 30 Hz
+    dt: float = 1.0 / 60.0      # period of one recorded row, 60 Hz
     record_decimation: int = 1  # distinct physics steps per recorded row
-    progress_every: int = 100   # recorded steps between collection progress lines
+    progress_every: int = 200   # recorded steps between collection progress lines
 
     # ------------------------------------------------------------------
     # CSV schema
@@ -58,7 +58,7 @@ class ExperimentConfig:
     # Model
     # ------------------------------------------------------------------
     state_dim: int = 128        # latent state order of each NSSM stage
-    history_window: int = 60    # past command steps stacked into each feature vector
+    history_window: int = 120   # past command steps stacked into each feature vector
 
     # ------------------------------------------------------------------
     # Training
@@ -90,7 +90,7 @@ class ExperimentConfig:
     # steps. MULTISINE ignores this and draws from its own bands.
     signal_ranges: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         "RAMPS": (0.1, 1.5),
-        "PRBS": (20, 60),
+        "PRBS": (40, 120),
         "CHIRP": (0.1, 2.0),
         "MULTISINE": (0.1, 3.0),
         "SMOOTH_NOISE": (0.1, 2.0),
@@ -100,8 +100,8 @@ class ExperimentConfig:
     # Test-set collection (collector mode 2)
     # ------------------------------------------------------------------
     test_episodes: int = 10
-    test_episode_len: int = 1000
-    test_reset_len: int = 150
+    test_episode_len: int = 2000
+    test_reset_len: int = 300
     test_signal_type: str = "SMOOTH_NOISE"
 
     # ------------------------------------------------------------------
@@ -130,7 +130,7 @@ class ExperimentConfig:
     # window, applied at the start of every episode and whenever the recovery
     # controller hands the actuator back. Keep the window several times longer
     # than one period of the highest frequency the physics step can carry.
-    fade_in_steps: int = 12          # 0.4 s at 30 Hz; 0 disables the fade
+    fade_in_steps: int = 24          # 0.4 s at 60 Hz; 0 disables the fade
 
     # ------------------------------------------------------------------
     # Actuator model (actuator.py), applied to every published command
@@ -188,7 +188,7 @@ class ExperimentConfig:
     viz_train_episodes: Tuple[int, ...] = (10, 100, 250, 400)
     viz_include_test: bool = True
     viz_test_start: int = 9200          # first row sliced out of the test CSV
-    viz_test_len: Optional[int] = 1150  # None means "to the end of the file"
+    viz_test_len: Optional[int] = 2300  # None means "to the end of the file"
     viz_channels: Tuple[int, ...] = (0, 1, 2, 3)  # which target_cols to plot
 
     # ------------------------------------------------------------------
