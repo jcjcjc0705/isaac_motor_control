@@ -272,7 +272,14 @@ isaac_motor_control/
 改動係數、慣量或物理步長之後，一定要做這個檢查：**推動機構後放手，確認運動會衰減**。
 
 `isaac_scripts/actuator_model.py` 是同一個模型的模擬器內版本，把程式碼烘進 USD 的
-Script Node，以 body torque 施力。兩者**只能擇一啟用**，同時啟用會讓摩擦變成兩倍。
+Script Node，以 body torque 施力，在每個物理步的前置回呼中以該步即將積分的速度計算。
+
+`actuator_in_simulator` 決定由哪一邊負責。兩者**只能擇一啟用**，同時啟用會讓摩擦
+變成兩倍；設為 `True` 時 `/joint_command` 只帶激勵，Script Node 必須填入與
+config 相同的係數。
+
+摩擦是回授項，經由 ROS 計算時會用到上一次收到的速度，延遲隨訂閱佇列深度增加。
+要讓受控體不受命令路徑延遲影響時，把它交給模擬器。
 
 ## 資料格式
 
