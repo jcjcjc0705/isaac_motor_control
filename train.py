@@ -1,12 +1,12 @@
 """Train the cascaded NSSM on collected motor data.
 
 Reads ``cfg.data_file``, writes the checkpoint and scaler named by the config,
-and logs scalars to runs/ for TensorBoard.
+and logs scalars for TensorBoard, all under ``cfg.experiment_dir``.
 
 Usage:
 
     python train.py
-    tensorboard --logdir runs
+    tensorboard --logdir results/<experiment>/runs
 
 All settings come from src/speed_control/speed_control/config.py. Edit that
 file and re-run; this script takes no command-line arguments.
@@ -49,7 +49,8 @@ def set_seeds(config) -> None:
 def launch_tensorboard(config) -> None:
     try:
         subprocess.Popen(
-            ["tensorboard", "--logdir", "runs", "--port", str(config.tensorboard_port)],
+            ["tensorboard", "--logdir", config.tensorboard_dir,
+             "--port", str(config.tensorboard_port)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -160,7 +161,7 @@ def train() -> None:
     if SummaryWriter is None:
         print("Warning: tensorboard is not installed, scalar logging disabled")
     else:
-        run_dir = os.path.join("runs", f"{cfg.run_name}_{int(time.time())}")
+        run_dir = os.path.join(cfg.tensorboard_dir, f"{cfg.run_name}_{int(time.time())}")
         writer = SummaryWriter(run_dir)
         print(f"Logging to {run_dir}")
         if cfg.launch_tensorboard:
