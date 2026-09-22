@@ -45,11 +45,10 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # CSV schema
     # ------------------------------------------------------------------
-    # The model is fitted to the efforts the simulator reports it applied,
-    # which arrive in the same message as the response to them. Both joints
-    # appear as both are commanded, so the input is the whole torque the
-    # mechanism received and the plant learned is the undamped mechanism.
-    input_cols: Tuple[str, ...] = ("effort_motor", "effort_joint1")
+    # The model is driven by the excitation as it was published, before the
+    # actuator model's friction is added and before the command path's dead
+    # time. Both therefore belong to the plant the model learns.
+    input_cols: Tuple[str, ...] = ("input_u",)
     # Order matters: the first two targets belong to the motor stage, the last
     # two to the joint stage of CascadedSystem.
     target_cols: Tuple[str, ...] = ("pos_motor", "vel_motor", "pos_joint1", "vel_joint1")
