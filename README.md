@@ -126,7 +126,7 @@ src/speed_control/speed_control/config.py
 |---|---|---|
 | 路徑 | `experiment`, `results_root` | 一輪的所有輸出都落在 `results/<experiment>/`，其餘路徑由它推導 |
 | 回合結構 | `episode_len`, `reset_len`, `total_episodes`, `dt`, `record_decimation` | 一列 = 一個物理步 = 一個控制週期 |
-| CSV 欄位 | `input_cols`, `target_cols` | 模型輸入是兩個關節實際施加的 effort |
+| CSV 欄位 | `input_cols`, `target_cols` | 模型輸入是送出的激勵命令 |
 | 模型 | `state_dim`, `history_window` | 狀態階數與堆疊的歷史命令步數 |
 | 訓練 | `batch_size`, `learning_rate`, `epochs`, `val_ratio`, `seed`, `deterministic` | |
 | 激勵訊號 | `signal_mix`, `signal_ranges`, `fade_in_steps` | 振幅不是設定值，由規劃器依預測擺幅推算 |
@@ -289,9 +289,9 @@ config 相同的係數。
 | `time_actual` | 模擬器時鐘，從收集開始起算的秒數 |
 | `time_ideal` | `global_step * dt`，理想時間軸 |
 | `episode_id` | 回合編號，從 0 起 |
-| `input_u` | 送出的激勵力矩，已乘上淡入窗，不含摩擦；歸零控制器接管期間為 0 |
-| `effort_motor` | 模擬器回報實際施加在馬達上的力矩，模型輸入 |
-| `effort_joint1` | 同上，連桿鉸鏈，模型輸入 |
+| `input_u` | 送出的激勵力矩，已乘上淡入窗，不含摩擦；歸零控制器接管期間為 0。**模型輸入** |
+| `effort_motor` | 模擬器回報實際施加在馬達上的力矩 |
+| `effort_joint1` | 同上，連桿鉸鏈 |
 | `signal_type` | 該回合的激勵訊號種類，訓練時用於分層切分 |
 | `pos_motor`, `vel_motor` | 馬達位置與速度 |
 | `pos_joint1`, `vel_joint1` | 第一連桿位置與速度 |
