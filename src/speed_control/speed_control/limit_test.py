@@ -176,11 +176,14 @@ def recovery_effort(tracker: JointStateTracker, cfg) -> float:
 
 
 def is_settled(tracker: JointStateTracker, cfg) -> bool:
-    """Both joints near zero and stopped."""
-    return (abs(tracker.motor_pos) < cfg.settled_pos_tol
-            and abs(tracker.motor_vel) < cfg.settled_vel_tol
-            and abs(tracker.joint1_pos) < cfg.settled_pos_tol
-            and abs(tracker.joint1_vel) < cfg.settled_vel_tol)
+    """Every joint near zero and stopped."""
+    pairs = (
+        (tracker.motor_pos, tracker.motor_vel),
+        (tracker.joint1_pos, tracker.joint1_vel),
+        (tracker.joint2_pos, tracker.joint2_vel),
+    )
+    return all(abs(pos) < cfg.settled_pos_tol and abs(vel) < cfg.settled_vel_tol
+               for pos, vel in pairs)
 
 
 def main(args=None) -> None:

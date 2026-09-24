@@ -67,45 +67,54 @@ class NSSM(nn.Module):
 
 
 class CascadedSystem(nn.Module):
-    """Two NSSM stages: motor first, then the link it drives.
+    """One NSSM stage per joint, chained along the mechanism.
 
-    The joint stage takes the motor stage's prediction as an extra input,
-    detached, so joint-side error does not back-propagate into the motor model
-    and the two stages train independently.
+    Each stage predicts its joint's position and velocity from the command
+    features; every stage after the first also takes the previous stage's
+    prediction, detached, so a stage's error does not back-propagate into the
+    one before it and the stages train independently.
 
-    Output channel order matches ``cfg.target_cols``: the first two channels
-    come from the motor stage, the last two from the joint stage.
+    Output channel order matches ``cfg.target_cols``: two channels per stage,
+    in the order the stages are chained.
     """
 
-    def __init__(self, state_dim: int, input_dim: int, history_window: int, output_dim: int):
+    def __init__(self, state_dim: int, input_dim: int, history_window: int,
+                 output_dim: int):
         super().__init__()
-        if output_dim != 4:
+        if output_dim < 2 or output_dim % 2:
             raise ValueError(
-                f"CascadedSystem is a fixed 2 + 2 cascade, got output_dim={output_dim}"
+                "CascadedSystem predicts a position and a velocity per stage, so "
+                f"output_dim must be an even number of at least 2, got {output_dim}"
             )
         self.output_dim = output_dim
 
         command_dim = feature_dim(input_dim, history_window)
-        self.stage_motor = NSSM(state_dim, command_dim, output_dim=2)
-        self.stage_joint = NSSM(state_dim, command_dim + 2, output_dim=2)
+        self.stages = nn.ModuleList(
+            NSSM(state_dim, command_dim + (0 if index == 0 else 2), output_dim=2)
+            for index in range(output_dim // 2)
+        )
 
     def forward(self, u_sequence: torch.Tensor, initial_states) -> torch.Tensor:
-        pred_motor = self.stage_motor(u_sequence, initial_states[0])
-        joint_input = torch.cat([u_sequence, pred_motor.detach()], dim=2)
-        pred_joint = self.stage_joint(joint_input, initial_states[1])
-        return torch.cat([pred_motor, pred_joint], dim=2)
+        predictions = []
+        stage_input = u_sequence
+        for index, stage in enumerate(self.stages):
+            prediction = stage(stage_input, initial_states[index])
+            predictions.append(prediction)
+            stage_input = torch.cat([u_sequence, prediction.detach()], dim=2)
+        return torch.cat(predictions, dim=2)
 
     def initial_states(self, batch_size: int, device) -> list:
         """Zero initial state for each stage."""
         return [
             torch.zeros(batch_size, stage.state_dim, device=device)
-            for stage in (self.stage_motor, self.stage_joint)
+            for stage in self.stages
         ]
 
 
 def build_model(cfg: ExperimentConfig) -> CascadedSystem:
     """Construct the model described by the config."""
-    return CascadedSystem(cfg.state_dim, cfg.input_dim, cfg.history_window, cfg.output_dim)
+    return CascadedSystem(cfg.state_dim, cfg.input_dim, cfg.history_window,
+                          cfg.output_dim)
 
 
 def load_model(cfg: ExperimentConfig, device) -> CascadedSystem:

@@ -126,7 +126,7 @@ src/speed_control/speed_control/config.py
 | 模型 | `state_dim`, `history_window` | 狀態階數與堆疊的歷史命令步數 |
 | 訓練 | `batch_size`, `learning_rate`, `epochs`, `val_ratio`, `seed`, `deterministic` | |
 | 激勵訊號 | `signal_mix`, `signal_ranges`, `fade_in_steps` | 振幅不是設定值，由規劃器依預測擺幅推算 |
-| 安全極限 | `hard_limit`, `abort_limit`, `planner_safe_limit`, `planner_lookahead_limit` | 見「安全機制」 |
+| 安全極限 | `hard_limit`, `abort_limit`, `abort_velocity`, `planner_safe_limit`, `planner_lookahead_limit` | 見「安全機制」 |
 | 機構增益 | `effort_to_pos_gain`, `plant_time_constant` | 決定規劃器的預測 |
 | **致動器模型** | `b_viscous_*`, `b_coulomb_*`, `inertia_*`, `max_damping_torque` | 見「致動器模型」 |
 | 歸零控制 | `reset_kp`, `reset_kd`, `max_effort` | |
@@ -186,7 +186,9 @@ ros2 run speed_control data_collector     # 選 1 收訓練資料，選 2 收測
   held effort for that : 1.135 effort units; faster waveforms are given more, up to 2.50
 ```
 
-收集開始前 node 會先等機構完全靜止。兩種模式都會直接覆寫目標檔案。
+收集開始前 node 會先等機構靜止，判準是 `settled_pos_tol` 與 `settled_vel_tol`，
+上限為 `settle_timeout`。這兩個容差必須大於場景自身的漂移 —— 一串被動連桿在求解器裡
+永遠不會完全靜止，容差訂在那個底線之下則等多久都不會成立。兩種模式都會直接覆寫目標檔案。
 
 存檔時印出的這一行應該是 **1.00 步**：
 
@@ -261,12 +263,31 @@ isaac_motor_control/
 ```
 
 分母的修正等同於隱式步的結果，讓係數可以取得比顯式形式更大。力矩會與激勵合成，
-兩個關節各送一個值到 `/joint_command`；連桿的鉸鏈沒有激勵，但摩擦一樣走這條路。
+每個關節各送一個值到 `/joint_command`；連桿的鉸鏈沒有激勵，但摩擦一樣走這條路。
 
-**係數受物理步長限制。** 太大時機構會以物理步率的一半振盪且永不停止，而且上限是
-**兩個關節合起來**的性質 —— 把兩者同時加倍會振盪，單獨加倍其中一個則不會。
+**穩定與否由 `inertia_*` 決定，不是由 `b_viscous_*`。** 摩擦是用上一步的速度算出、
+在這一步才施加的，所以它是一個帶一步延遲的迴路，其穩定判據為
+
+```
+c = b_eff · dt / I_實際 < 1        其中 b_eff = b_viscous / (1 + b_viscous · dt / inertia)
+```
+
+把 `inertia` 填成關節真正的等效慣量或更小，代入後 `c = x/(1+x) < 1` 恆成立，
+`b_viscous` 取多大都不會發散；填得比實際大則 `c` 可能超過 1，摩擦會改為注入能量，
+速度逐步變號並放大，數步之內就發散。**所以 `inertia_*` 要實測並向下取整。**
+
+量法是從靜止對單一關節施加一步已知力矩 τ，量該步產生的速度變化，正負兩次相減
+可以消掉重力與耦合項：`I = 2·τ·dt / (Δω⁺ − Δω⁻)`。
+
+`b_eff` 的上限是 `inertia / dt`，所以慣量小的外側連桿能得到的阻尼也小，
+把 `b_viscous` 往上加只會逼近這個天花板。
 
 改動係數、慣量或物理步長之後，一定要做這個檢查：**推動機構後放手，確認運動會衰減**。
+判準是速度的逐步變號率 —— 單調衰減的機構幾乎不變號，變號率接近 0.5 就是在以物理步率
+的一半振盪。
+
+**另有一條與阻尼無關的上限：求解器本身。** 單一物理步內的關節位移過大時，
+articulation 求解器會失去精度而發散，與摩擦係數無關。壓低它的唯一手段是降低激勵振幅。
 
 `isaac_scripts/actuator_model.py` 是同一個模型的模擬器內版本，把程式碼烘進 USD 的
 Script Node，以 body torque 施力。兩者**只能擇一啟用**，同時啟用會讓摩擦變成兩倍。
@@ -293,18 +314,25 @@ Script Node，以 body torque 施力。兩者**只能擇一啟用**，同時啟�
 
 ## 模型架構
 
-`CascadedSystem` 由兩段 `NSSM` 串聯：
+`CascadedSystem` 是一串 `NSSM`，每兩個 `target_cols` 一段，段數由 `output_dim // 2`
+決定：
 
 ```
-u_seq --> [stage_motor] --> pred_motor (pos_motor, vel_motor)
-   |                             | detach()
-   +---------- concat -----------+
-                 |
-                 v
-          [stage_joint] --> pred_joint (pos_joint1, vel_joint1)
+u_seq --> [stage_0] --> pred_0 (pos_motor, vel_motor)
+   |                        | detach()
+   +-------- concat --------+
+                |
+                v
+          [stage_1] --> pred_1 (pos_joint1, vel_joint1)
+                |           | detach()
+   +-------- concat --------+
+                |
+                v
+          [stage_2] --> pred_2 (pos_joint2, vel_joint2)
 ```
 
-連桿段會看到馬達段的預測，但該張量經過 `detach()`，兩段各自獨立學習。
+每一段都看得到 `u_seq` 與上一段的預測，但該張量經過 `detach()`，各段獨立學習。
+第一段的輸入寬度是 `feature_dim(input_dim, history_window)`，其後每段再加 2。
 
 單段 `NSSM` 為離散時間非線性狀態空間模型：
 
@@ -330,8 +358,12 @@ x_{t+1} = (1 - a) x_t + a f(x_t, u_t)
    `lookahead` 秒的速度」，超過就再縮。只有快速的波形會被它壓低。
 3. **`abort_limit`** —— 執行期即時保護。每步做前瞻預測，一旦當前或預測位置越界，
    立刻放棄該回合剩餘的激勵，把馬達交給歸零控制器。
-4. **`hard_limit`** —— 機構行程極限，用於事後統計。存檔時會報告有多少列、
+4. **`abort_velocity`** —— 同一層的速度判準。位置在解析時就折疊到 ±π，被動連桿一旦
+   翻過頂點持續旋轉，它的角度會讀成回到 0 附近，只有速度看得出來。
+5. **`hard_limit`** —— 機構行程極限，用於事後統計。存檔時會報告有多少列、
    哪些回合曾經超過，以及是否出現非有限值。
+
+收集中途若出現非有限值，已錄到的資料仍會寫出，只丟棄含非有限值的那幾個回合。
 
 ### 激勵的淡入
 
@@ -364,8 +396,11 @@ w(i) = 1                                        i >= fade_in_steps
 **激勵振幅不是設定值**：波形以單位振幅產生，再縮放到上面兩個預測都合格為止，
 最後截在 `max_effort`。
 
-`plant_time_constant` 的校法是拿一份收好的資料，比較預測擺幅與實際擺幅，
-取比值中位數為 1 的那個 tau。
+`plant_time_constant` 屬於**擺得最遠的那個關節**，在連桿機構上通常是末端的輕連桿
+而非被驅動的那個，其值約為該關節的 `inertia / b_eff`。用被驅動關節的時間常數會高估
+快波形所受的衰減，規劃器便把這些波形放大到機構承受不住的振幅。
+
+校法是拿一份收好的資料，比較預測擺幅與實際擺幅，取比值中位數為 1 的那個 tau。
 
 預測有散度，安全帶與中止門檻之間的差距是留給它的。
 

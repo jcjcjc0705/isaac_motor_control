@@ -114,9 +114,9 @@ class DataCollectorNode(Node):
             return
         if not self.tracker.is_finite():
             print("\nError: /joint_states went non-finite, the simulator has "
-                  "diverged. Stop and Play in Isaac Sim, then re-run. "
-                  f"Discarding {len(self.rows)} rows.")
+                  "diverged. Stop and Play in Isaac Sim, then re-run.")
             self.send_effort(0.0)
+            self.save()
             raise SystemExit
 
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -167,15 +167,20 @@ class DataCollectorNode(Node):
     # Excitation loop
     # ------------------------------------------------------------------
     def should_abort(self) -> bool:
-        """True once the rig is at, or predicted to reach, its travel limit."""
-        motor_pos = self.tracker.motor_pos
-        joint_pos = self.tracker.joint1_pos
-        predicted_motor = motor_pos + self.tracker.motor_vel * self.cfg.lookahead
-        predicted_joint = joint_pos + self.tracker.joint1_vel * self.cfg.lookahead
-        return (abs(motor_pos) > self.cfg.abort_limit
-                or abs(joint_pos) > self.cfg.abort_limit
-                or abs(predicted_motor) > self.cfg.hard_limit
-                or abs(predicted_joint) > self.cfg.hard_limit)
+        """True once the rig is at, predicted to reach, or running past its limit.
+
+        Angles arrive wrapped to +/-pi, so a passive link that turns all the
+        way round reads as back near zero. The speed test is what catches that.
+        """
+        pairs = (
+            (self.tracker.motor_pos, self.tracker.motor_vel),
+            (self.tracker.joint1_pos, self.tracker.joint1_vel),
+            (self.tracker.joint2_pos, self.tracker.joint2_vel),
+        )
+        return any(abs(pos) > self.cfg.abort_limit
+                   or abs(vel) > self.cfg.abort_velocity
+                   or abs(pos + vel * self.cfg.lookahead) > self.cfg.hard_limit
+                   for pos, vel in pairs)
 
     def excitation_command(self) -> float:
         """Excitation command for one step, handing over to recovery if needed.
@@ -299,7 +304,11 @@ class DataCollectorNode(Node):
     )
 
     def save(self) -> None:
-        """Write the recorded rows to the CSV."""
+        """Write the recorded rows to the CSV.
+
+        A run that ends early still writes what it reached, so the episodes
+        recorded before the rig left its range are not lost with it.
+        """
         if not self.rows:
             print("Error: no joint states were received, nothing to save")
             return
@@ -314,8 +323,13 @@ class DataCollectorNode(Node):
                       + [c for c in df.columns if c.startswith("vel_")]
                       + ["effort_motor", "effort_joint1"])
         # Counted separately: a comparison against NaN is False, so non-finite
-        # rows never appear in the limit count.
+        # rows never appear in the limit count. A whole episode goes with any
+        # non-finite row in it, since training rolls an episode out as one
+        # sequence and a gap inside it has no meaning.
         non_finite = ~df[state_cols].map(lambda v: pd.notna(v)).all(axis=1)
+        diverged = df[non_finite]["episode_id"].unique()
+        if len(diverged):
+            df = df[~df["episode_id"].isin(diverged)]
         exceeded = df[position_cols].abs().gt(self.cfg.hard_limit).any(axis=1)
         failed = df[exceeded]["episode_id"].unique()
 
@@ -324,11 +338,9 @@ class DataCollectorNode(Node):
 
         print("")
         print(f"Saved {len(df)} rows to {os.path.abspath(self.output_path)}")
-        if non_finite.any():
-            print(f"  WARNING non-finite rows   : {int(non_finite.sum())} "
-                  f"({non_finite.mean() * 100:.2f}%) in episodes "
-                  f"{df[non_finite]['episode_id'].unique().tolist()}")
-            print("  The simulator diverged; this dataset is not usable.")
+        if len(diverged):
+            print(f"  Episodes dropped as non-finite: {len(diverged)} "
+                  f"({diverged.tolist()})")
         print(f"  Rows over {self.cfg.hard_limit} rad : "
               f"{int(exceeded.sum())} ({exceeded.mean() * 100:.2f}%)")
         if len(failed):

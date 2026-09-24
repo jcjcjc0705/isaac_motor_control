@@ -24,7 +24,7 @@ class ExperimentConfig:
     # TensorBoard logs -- is written under results_root/experiment. Give each
     # configuration its own experiment name and nothing a previous run wrote is
     # overwritten. The directories below are derived from it.
-    experiment: str = "main-60-30"
+    experiment: str = "three-joint-60-30"
     results_root: str = "results"
 
     # ------------------------------------------------------------------
@@ -51,7 +51,11 @@ class ExperimentConfig:
     input_cols: Tuple[str, ...] = ("input_u",)
     # Order matters: the first two targets belong to the motor stage, the last
     # two to the joint stage of CascadedSystem.
-    target_cols: Tuple[str, ...] = ("pos_motor", "vel_motor", "pos_joint1", "vel_joint1")
+    target_cols: Tuple[str, ...] = (
+        "pos_motor", "vel_motor",
+        "pos_joint1", "vel_joint1",
+        "pos_joint2", "vel_joint2",
+    )
 
     # ------------------------------------------------------------------
     # Model
@@ -114,15 +118,24 @@ class ExperimentConfig:
     # quantity the collector aborts on. Only fast waveforms are held back by
     # it; a slow one is bounded by planner_safe_limit first.
     planner_lookahead_limit: float = 1.35
+    # Speed above which a joint is treated as running away rather than being
+    # driven, and the excitation is handed to the recovery controller. A
+    # passive link that goes over the top keeps turning, and its wrapped angle
+    # stays inside the band the position tests watch, so speed is the only
+    # thing that reports it.
+    abort_velocity: float = 30.0     # rad/s
     # Radians of excursion per unit of held effort, from collector mode 3, and
     # what modes 1 and 2 prompt for at startup. Re-measure after any change to
     # the links, masses or friction. Use the peak gain mode 3 reports, not the
     # equilibrium one.
-    effort_to_pos_gain: float = 1.013
+    effort_to_pos_gain: float = 0.846
     # Seconds. The peak predictor low-passes the command with this time
-    # constant before scaling it by the gain. Calibrate it by comparing the
-    # predicted excursions against those a collected dataset reached.
-    plant_time_constant: float = 0.3
+    # constant before scaling it by the gain. It belongs to whichever joint
+    # swings furthest, which on a linkage is a light outer link rather than the
+    # driven one, so take it from that joint's inertia over its damping.
+    # Calibrate it by comparing the predicted excursions against those a
+    # collected dataset reached.
+    plant_time_constant: float = 0.10
     max_slew_rate: float = 500.0     # largest step-to-step change in the command
     lookahead: float = 0.2           # seconds of forward prediction before aborting
     # Steps over which the excitation is eased in from zero by a raised-cosine
@@ -144,14 +157,20 @@ class ExperimentConfig:
     # physics step, kick the rig and check that the motion decays.
     b_viscous_motor: float = 0.15     # N*m*s/rad
     b_coulomb_motor: float = 0.0      # N*m, speed independent
-    b_viscous_joint1: float = 0.025
+    b_viscous_joint1: float = 0.08
     b_coulomb_joint1: float = 0.0
+    b_viscous_joint2: float = 0.05
+    b_coulomb_joint2: float = 0.0
     max_damping_torque: float = 2.0   # ceiling on either joint's friction
     # Each joint's effective inertia, from the velocity one step of a known
-    # torque produces. The actuator model scales the viscous term with it; too
-    # small only makes the damping gentler, too large lets it ring.
-    inertia_motor: float = 0.022      # kg*m^2
-    inertia_joint1: float = 0.004
+    # torque produces. The actuator model scales the viscous term with it, and
+    # the scaled coefficient keeps the friction dissipative for any b_viscous
+    # as long as the value here does not exceed the inertia the joint really
+    # has. Measure it and round down: too small only makes the damping gentler,
+    # too large lets the joint ring and then diverge.
+    inertia_motor: float = 0.020      # kg*m^2
+    inertia_joint1: float = 0.0010
+    inertia_joint2: float = 0.00035
 
     # ------------------------------------------------------------------
     # Recovery controller, used during the reset phase and after an abort
@@ -163,9 +182,13 @@ class ExperimentConfig:
     reset_kp: float = 0.0
     reset_kd: float = 0.0
     max_effort: float = 2.5         # ceiling on any effort the nodes publish
+    # The rig coasts to a true stop on the actuator's friction alone, but a
+    # chain of passive links takes far longer to do it than one link does, so
+    # settle_timeout has to cover the whole decay rather than the driven
+    # joint's time constant.
     settled_pos_tol: float = 0.02   # radians from zero that counts as settled
     settled_vel_tol: float = 0.05   # rad/s that counts as stopped
-    settle_timeout: float = 20.0    # seconds of simulator time before giving up
+    settle_timeout: float = 60.0    # seconds of simulator time before giving up
 
     # ------------------------------------------------------------------
     # Gain calibration (collector mode 3)
@@ -188,7 +211,7 @@ class ExperimentConfig:
     viz_include_test: bool = True
     viz_test_start: int = 9200          # first row sliced out of the test CSV
     viz_test_len: Optional[int] = 1150  # None means "to the end of the file"
-    viz_channels: Tuple[int, ...] = (0, 1, 2, 3)  # which target_cols to plot
+    viz_channels: Tuple[int, ...] = (0, 1, 2, 3, 4, 5)  # which target_cols to plot
 
     # ------------------------------------------------------------------
     # Data inspection (plot_data.py)

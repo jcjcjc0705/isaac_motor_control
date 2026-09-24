@@ -47,4 +47,8 @@ def actuator_efforts(tracker, cfg, excitation: float) -> dict:
             tracker.joint1_vel, cfg.b_viscous_joint1, cfg.b_coulomb_joint1,
             cfg.max_damping_torque, cfg.dt, cfg.inertia_joint1,
         ),
+        "joint2": damping_torque(
+            tracker.joint2_vel, cfg.b_viscous_joint2, cfg.b_coulomb_joint2,
+            cfg.max_damping_torque, cfg.dt, cfg.inertia_joint2,
+        ),
     }
