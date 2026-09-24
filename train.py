@@ -94,7 +94,7 @@ def run_epoch(model, loader, device, optimizer=None, progress_label=None):
             u_batch = u_batch.to(device)
             y_batch = y_batch.to(device)
 
-            y_pred = model(u_batch, model.initial_states(u_batch.size(0), device))
+            y_pred = model(u_batch, model.initial_states(y_batch[:, 0, :], device))
             loss = sequence_loss(y_batch, y_pred)
 
             if is_training:

@@ -24,7 +24,7 @@ class ExperimentConfig:
     # TensorBoard logs -- is written under results_root/experiment. Give each
     # configuration its own experiment name and nothing a previous run wrote is
     # overwritten. The directories below are derived from it.
-    experiment: str = "three-joint-60-30"
+    experiment: str = "three-joint-60-30-y0"
     results_root: str = "results"
 
     # ------------------------------------------------------------------
@@ -62,6 +62,11 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     state_dim: int = 128        # latent state order of each NSSM stage
     history_window: int = 60    # past command steps stacked into each feature vector
+    # Where each stage's rollout starts. False rolls from a zero state, which
+    # asks every episode to begin at rest; True encodes the episode's first
+    # recorded output into the state instead, for a mechanism whose reset phase
+    # is shorter than its decay.
+    initial_state_from_data: bool = True
 
     # ------------------------------------------------------------------
     # Training

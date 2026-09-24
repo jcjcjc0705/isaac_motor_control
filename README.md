@@ -123,7 +123,7 @@ src/speed_control/speed_control/config.py
 | 路徑 | `experiment`, `results_root` | 一輪的所有輸出都落在 `results/<experiment>/`，其餘路徑由它推導 |
 | 回合結構 | `episode_len`, `reset_len`, `total_episodes`, `dt`, `record_decimation` | 一列 = 一個物理步 = 一個控制週期 |
 | CSV 欄位 | `input_cols`, `target_cols` | 模型輸入是送出的激勵命令 |
-| 模型 | `state_dim`, `history_window` | 狀態階數與堆疊的歷史命令步數 |
+| 模型 | `state_dim`, `history_window`, `initial_state_from_data` | 狀態階數、堆疊的歷史命令步數、展開的起點 |
 | 訓練 | `batch_size`, `learning_rate`, `epochs`, `val_ratio`, `seed`, `deterministic` | |
 | 激勵訊號 | `signal_mix`, `signal_ranges`, `fade_in_steps` | 振幅不是設定值，由規劃器依預測擺幅推算 |
 | 安全極限 | `hard_limit`, `abort_limit`, `abort_velocity`, `planner_safe_limit`, `planner_lookahead_limit` | 見「安全機制」 |
@@ -343,6 +343,21 @@ x_{t+1} = (1 - a) x_t + a f(x_t, u_t)
 
 `a = sigmoid(alpha_raw)` 是可學習的積分洩漏率，初始值約 0.12。這個殘差形式
 （等同前向歐拉積分）讓狀態預設變化緩慢，是能對數百步做 BPTT 而不發散的關鍵。
+
+### 展開的起點
+
+`initial_state_from_data` 決定每一段從什麼狀態開始展開：
+
+- `False` —— 從零狀態開始，等於假設每個回合都從靜止起步
+- `True` —— 每段多一個編碼器，把該回合第一列的觀測（該段負責的那兩個通道，
+  正規化後）映射成初始狀態
+
+連桿數越多，機構從激勵衰減到靜止所需的時間越長；當它超過 `reset_len`，回合就不是
+從靜止起步，而且每個回合的初始條件是前一個回合的衰減狀態。此時零狀態的假設會把誤差
+集中在每個回合的開頭，受害最深的是衰減最慢的那個關節。用 `ringdown` 類的量測比較
+衰減時間與 `reset_len`，就能判斷該用哪一個。
+
+兩種設定的 checkpoint 形狀不同，不能互相載入。
 
 輸入特徵為 `[u, u 的一階差分]` 再堆疊過去 `history_window` 步，因此每個時間點的
 輸入維度為 `input_dim * 2 * history_window`。

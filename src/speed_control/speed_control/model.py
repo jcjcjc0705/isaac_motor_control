@@ -21,9 +21,14 @@ class NSSM(nn.Module):
     The state update is a residual (forward Euler) step whose leak rate ``a`` is
     learned through a sigmoid, initialised small so the state starts out nearly
     constant and backpropagation through several hundred steps stays stable.
+
+    ``initial_from_output`` adds an encoder that maps the first observed output
+    of a sequence to the state the rollout starts from, for a plant whose
+    episodes do not begin at rest.
     """
 
-    def __init__(self, state_dim: int, input_dim: int, output_dim: int):
+    def __init__(self, state_dim: int, input_dim: int, output_dim: int,
+                 initial_from_output: bool = False):
         super().__init__()
         self.state_dim = state_dim
 
@@ -43,6 +48,22 @@ class NSSM(nn.Module):
         self.d_net = nn.Linear(input_dim, output_dim, bias=False)
         # sigmoid(-2.0) ~ 0.12
         self.alpha_raw = nn.Parameter(torch.tensor([-2.0]))
+        self.x0_net = nn.Sequential(
+            nn.Linear(output_dim, 32),
+            nn.Tanh(),
+            nn.Linear(32, state_dim),
+        ) if initial_from_output else None
+
+    def initial_state(self, y_initial: torch.Tensor) -> torch.Tensor:
+        """State to roll from, encoded from the sequence's first output.
+
+        ``y_initial`` is [batch, output_dim] in the same normalised units the
+        forward pass predicts. Without the encoder the state starts at zero.
+        """
+        if self.x0_net is None:
+            return torch.zeros(y_initial.shape[0], self.state_dim,
+                               device=y_initial.device)
+        return self.x0_net(y_initial)
 
     def forward(self, u_sequence: torch.Tensor, x_initial: torch.Tensor) -> torch.Tensor:
         """Roll the model open-loop over a command sequence.
@@ -76,10 +97,14 @@ class CascadedSystem(nn.Module):
 
     Output channel order matches ``cfg.target_cols``: two channels per stage,
     in the order the stages are chained.
+
+    ``initial_state_from_data`` gives every stage an encoder from its first
+    observed output to the state it rolls from, so a sequence that does not
+    begin at rest is not asked to.
     """
 
     def __init__(self, state_dim: int, input_dim: int, history_window: int,
-                 output_dim: int):
+                 output_dim: int, initial_state_from_data: bool = False):
         super().__init__()
         if output_dim < 2 or output_dim % 2:
             raise ValueError(
@@ -90,7 +115,8 @@ class CascadedSystem(nn.Module):
 
         command_dim = feature_dim(input_dim, history_window)
         self.stages = nn.ModuleList(
-            NSSM(state_dim, command_dim + (0 if index == 0 else 2), output_dim=2)
+            NSSM(state_dim, command_dim + (0 if index == 0 else 2), output_dim=2,
+                 initial_from_output=initial_state_from_data)
             for index in range(output_dim // 2)
         )
 
@@ -103,18 +129,23 @@ class CascadedSystem(nn.Module):
             stage_input = torch.cat([u_sequence, prediction.detach()], dim=2)
         return torch.cat(predictions, dim=2)
 
-    def initial_states(self, batch_size: int, device) -> list:
-        """Zero initial state for each stage."""
+    def initial_states(self, y_initial: torch.Tensor, device) -> list:
+        """State each stage rolls from, one per stage.
+
+        ``y_initial`` is the sequence's first output, normalised and shaped
+        [batch, output_dim]. Each stage reads the two channels it predicts.
+        """
+        y_initial = y_initial.to(device)
         return [
-            torch.zeros(batch_size, stage.state_dim, device=device)
-            for stage in self.stages
+            stage.initial_state(y_initial[:, 2 * index:2 * index + 2])
+            for index, stage in enumerate(self.stages)
         ]
 
 
 def build_model(cfg: ExperimentConfig) -> CascadedSystem:
     """Construct the model described by the config."""
     return CascadedSystem(cfg.state_dim, cfg.input_dim, cfg.history_window,
-                          cfg.output_dim)
+                          cfg.output_dim, cfg.initial_state_from_data)
 
 
 def load_model(cfg: ExperimentConfig, device) -> CascadedSystem:

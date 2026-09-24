@@ -54,9 +54,12 @@ def predict(model, scaler: Scaler, group: pd.DataFrame, config, device) -> np.nd
     """Roll the model open-loop over an episode and return unscaled outputs."""
     features = build_features(group[list(config.input_cols)].values, config.history_window)
     u_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
+    y_initial = torch.tensor(group[list(config.target_cols)].values[:1],
+                             dtype=torch.float32)
 
     with torch.no_grad():
-        y_norm = model(scaler.normalize_u(u_tensor), model.initial_states(1, device))
+        y_norm = model(scaler.normalize_u(u_tensor),
+                       model.initial_states(scaler.normalize_y(y_initial), device))
     return scaler.denormalize_y(y_norm.cpu())[0].numpy()
 
 
